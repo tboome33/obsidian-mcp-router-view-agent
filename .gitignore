@@ -1,0 +1,9 @@
+# Real deployment config + secrets — NEVER commit these.
+config.json
+view-agent.token
+secrets/
+
+# Runtime noise
+*.log
+__pycache__/
+*.pyc
