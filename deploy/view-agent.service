@@ -19,6 +19,7 @@ KillMode=control-group
 # Hardening (optional but cheap)
 NoNewPrivileges=true
 ProtectSystem=strict
+ProtectHome=true
 ReadOnlyPaths=/opt/view-agent
 PrivateTmp=true
 

@@ -67,7 +67,7 @@ Transport errors and timeouts are treated like 5xx (transient).
 GET {base}/health   →  200 {"ok": true, ...}
 ```
 
-Not used by the router; useful for cron-based crash recovery and monitoring (the reference launcher curls it before deciding to relaunch).
+Not used by the router; useful for cron-based crash recovery and monitoring (the reference launcher curls it before deciding to relaunch). Because it is token-free, it must leak nothing actionable — the reference impl returns the served vault names and an active-tunnel **count**, never the live tunnel URLs (those are exactly the unguessable hostnames the token gate protects).
 
 ## Security expectations on a provider
 

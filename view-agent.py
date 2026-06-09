@@ -45,6 +45,7 @@ Security posture (defence in depth)
 
 Python 3.8+ stdlib only — no pip dependencies. `cloudflared` must be on the machine.
 """
+import hmac
 import json
 import os
 import re
@@ -114,7 +115,9 @@ def load_config(path):
         for k in VAULT_REQUIRED:
             if not v.get(k):
                 raise ValueError('vault "%s" is missing required key "%s"' % (name, k))
-        unknown = [k for k in v if k not in VAULT_REQUIRED + VAULT_OPTIONAL]
+        # Keys starting with "_" are comments (config.example.json documents itself with
+        # them) — tolerated everywhere, so `cp config.example.json config.json` just works.
+        unknown = [k for k in v if not k.startswith("_") and k not in VAULT_REQUIRED + VAULT_OPTIONAL]
         if unknown:
             raise ValueError(
                 'vault "%s" has unknown key(s): %s (allowed: %s)'
@@ -142,21 +145,34 @@ def read_secret(cfg, vault_cfg, inline_key, file_key):
     try:
         with open(_resolve(cfg, p), encoding="utf-8") as f:
             return f.read().strip()
-    except OSError:
+    except OSError as e:
+        # Loud (value-free) so a mispointed/unreadable secret file is debuggable instead
+        # of silently producing credential-less URLs.
+        print("view-agent: cannot read %s (%s)" % (file_key, e), file=sys.stderr)
         return ""
 
 
 def read_token(cfg):
-    """The shared-secret gate value, or None when the token file is absent/unreadable
-    (= gate disabled)."""
+    """Shared-secret gate state: ("off", None) when no token file is configured or the
+    file is absent (= gate disabled), ("on", <token>) when armed, ("error", None) when
+    the file EXISTS but is unreadable OR empty — the caller must FAIL CLOSED on that
+    (a permissions mishap or a botched `openssl rand > file` must not silently disarm
+    the gate; review pass 2)."""
     p = cfg.get("token_file")
     if not p:
-        return None
+        return ("off", None)
     try:
         with open(_resolve(cfg, p), encoding="utf-8") as f:
-            return f.read().strip() or None
-    except OSError:
-        return None
+            val = f.read().strip()
+    except FileNotFoundError:
+        return ("off", None)
+    except OSError as e:
+        print("view-agent: token file unreadable (%s) — failing closed" % e, file=sys.stderr)
+        return ("error", None)
+    if not val:
+        print("view-agent: token file is EMPTY — failing closed", file=sys.stderr)
+        return ("error", None)
+    return ("on", val)
 
 
 class TunnelManager:
@@ -170,13 +186,28 @@ class TunnelManager:
         self.cfg = cfg
         self.start_fn = start_fn or self._start_cloudflared
         self.tunnels = {}
+        # Two-level locking: `lock` only guards the dicts (always held briefly);
+        # `vault_locks[name]` serializes ensure() PER VAULT, so one vault's cold start
+        # (up to url_wait_s) never blocks /health or warm /view calls on other vaults.
         self.lock = threading.Lock()
+        self.vault_locks = {}
+
+    def _vault_lock(self, vault_name):
+        with self.lock:
+            if vault_name not in self.vault_locks:
+                self.vault_locks[vault_name] = threading.Lock()
+            return self.vault_locks[vault_name]
 
     def _start_cloudflared(self, vault_name, vault_cfg):
-        log_path = os.path.join(
-            tempfile.gettempdir(), "view-agent-cf-%s.log" % re.sub(r"[^\w.-]", "_", vault_name)
+        # UNIQUE log file per start (mkstemp), not per vault name: starts are only
+        # serialized per vault, and two distinct names can sanitize to the same file
+        # ("work notes" / "work_notes") — sharing it could hand one vault the OTHER
+        # vault's tunnel URL (review pass 4). Files are kept for debugging; PrivateTmp
+        # (systemd) reaps them on restart.
+        fd, log_path = tempfile.mkstemp(
+            prefix="view-agent-cf-%s-" % re.sub(r"[^\w.-]", "_", vault_name), suffix=".log"
         )
-        log = open(log_path, "w")
+        log = os.fdopen(fd, "w")
         proc = subprocess.Popen(
             [self.cfg["cloudflared_path"], "tunnel", "--no-autoupdate",
              "--url", vault_cfg["gui_url"]],
@@ -202,20 +233,28 @@ class TunnelManager:
         return None
 
     def ensure(self, vault_name, vault_cfg):
-        """Return the public URL for this vault's tunnel, starting one if needed."""
-        with self.lock:
-            t = self.tunnels.get(vault_name)
-            if t and t["proc"].poll() is None and t.get("url"):
-                t["last"] = time.time()
-                return t["url"]
-            if t:  # dead leftover — clean it before starting fresh
-                try:
-                    t["proc"].terminate()
-                except Exception:
-                    pass
+        """Return the public URL for this vault's tunnel, starting one if needed.
+        Serialized per vault; the (slow) cold start runs OUTSIDE the global lock."""
+        with self._vault_lock(vault_name):
+            # Warm path + dead-leftover cleanup run UNDER the global lock (poll/terminate
+            # are instant) so the reaper can never interleave between the alive-check and
+            # the `last` refresh and kill a tunnel whose URL we are about to return
+            # (review pass 2). Only the SLOW cold start below runs outside it.
+            with self.lock:
+                t = self.tunnels.get(vault_name)
+                if t and t["proc"].poll() is None and t.get("url"):
+                    t["last"] = time.time()
+                    return t["url"]
+                if t:  # dead leftover — clean it before starting fresh
+                    try:
+                        t["proc"].terminate()
+                    except Exception:
+                        pass
+                    self.tunnels.pop(vault_name, None)
             nt = self.start_fn(vault_name, vault_cfg)
             if nt:
-                self.tunnels[vault_name] = nt
+                with self.lock:
+                    self.tunnels[vault_name] = nt
                 return nt["url"]
             return None
 
@@ -259,7 +298,9 @@ def navigate(cfg, vault_cfg, note):
         headers["Authorization"] = "Bearer " + api_key
     req = urllib.request.Request(url, method="POST", headers=headers)
     try:
-        urllib.request.urlopen(req, timeout=5)
+        # Short on purpose: a black-holed REST endpoint must not eat the router's 6s
+        # eager budget — a warm /view should still answer well under that.
+        urllib.request.urlopen(req, timeout=3)
     except Exception:
         pass
 
@@ -298,18 +339,30 @@ def make_handler(cfg, tunnels):
             u = urllib.parse.urlparse(self.path)
 
             if u.path == "/health":
+                # Token-free on purpose (cron probes it) — so it must leak nothing
+                # actionable: vault names + a COUNT, never the live tunnel URLs (those
+                # are exactly the unguessable hostnames the token gate protects).
                 return self._send(
                     200,
-                    {"ok": True, "tunnels": tunnels.snapshot(),
+                    {"ok": True, "active_tunnels": len(tunnels.snapshot()),
                      "vaults": sorted(cfg["vaults"].keys())},
                 )
 
             if u.path != "/view":
                 return self._send(404, {"error": "not found"})
 
-            # Gate 2 (token): only enforced when the token file exists. See CONTRACT.md.
-            tok = read_token(cfg)
-            if tok and self.headers.get("X-View-Token") != tok:
+            # Gate 2 (token): enforced when the token file exists; FAILS CLOSED if the
+            # file exists but can't be read. Constant-time compare. See CONTRACT.md.
+            mode, tok = read_token(cfg)
+            if mode == "error":
+                return self._send(503, {"error": "token file unreadable on the agent"})
+            # Compare as BYTES: compare_digest on str raises TypeError on any non-ASCII
+            # input (e.g. a pasted token with a BOM / non-breaking space), which would
+            # 500 instead of the contract's 401 (review pass 4).
+            if tok is not None and not hmac.compare_digest(
+                (self.headers.get("X-View-Token") or "").encode("utf-8", "replace"),
+                tok.encode("utf-8", "replace"),
+            ):
                 return self._send(401, {"error": "bad token"})
 
             q = urllib.parse.parse_qs(u.query)

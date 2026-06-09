@@ -125,6 +125,27 @@ class TestConfig(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown key"):
                 va.load_config(path)
 
+    def test_underscore_comment_keys_tolerated(self):
+        # The example config documents itself with "_"-prefixed keys — copying it
+        # verbatim must work (review finding: the documented Quickstart crashed).
+        with tempfile.TemporaryDirectory() as d:
+            path = write_config(
+                d,
+                vaults={
+                    "alice": {
+                        "gui_url": "http://127.0.0.1:3001",
+                        "_gui_url": "comment",
+                        "_open": "another comment",
+                    }
+                },
+            )
+            cfg = va.load_config(path)  # must not raise
+            self.assertIn("alice", cfg["vaults"])
+
+    def test_shipped_example_config_loads_verbatim(self):
+        cfg = va.load_config(os.path.join(HERE, "..", "config.example.json"))
+        self.assertEqual(sorted(cfg["vaults"].keys()), ["alice", "work"])
+
     def test_secret_file_resolved_relative_to_config_dir(self):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "secrets"))
@@ -169,11 +190,16 @@ class TestViewEndpoint(unittest.TestCase):
         self.agent.close()
         self.tmp.cleanup()
 
-    def test_health_lists_vaults(self):
+    def test_health_lists_vaults_but_never_tunnel_urls(self):
+        self.agent.get("/view?vault=alice")  # warm a tunnel first
         status, body = self.agent.get("/health")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
         self.assertEqual(body["vaults"], ["alice"])
+        # /health is token-free → it must expose a COUNT, never the live tunnel URLs
+        # (review finding: leaking them defeats the unguessable-hostname layer).
+        self.assertEqual(body["active_tunnels"], 1)
+        self.assertNotIn("trycloudflare", json.dumps(body))
 
     def test_unknown_path_404(self):
         status, body = self.agent.get("/nope")
@@ -232,6 +258,26 @@ class TestTokenGate(unittest.TestCase):
         status, _ = self.agent.get("/view?vault=alice", headers={"X-View-Token": "wrong"})
         self.assertEqual(status, 401)
 
+    def test_non_ascii_token_is_401_not_500(self):
+        # compare_digest on str raises TypeError on non-ASCII — must yield a clean 401,
+        # never an unhandled 500 (review pass 4).
+        status, _ = self.agent.get("/view?vault=alice", headers={"X-View-Token": "sékrit"})
+        self.assertEqual(status, 401)
+
+    def test_empty_token_file_fails_closed_503(self):
+        # An existing-but-empty token file means a botched secret generation — the gate
+        # must fail closed rather than silently disarm (review pass 2).
+        with tempfile.TemporaryDirectory() as d:
+            path = write_config(d)
+            open(os.path.join(d, "view-agent.token"), "w").close()  # empty
+            cfg = va.load_config(path)
+            agent = AgentHttp(cfg, fake_start_factory())
+            try:
+                status, _ = agent.get("/view?vault=alice")
+                self.assertEqual(status, 503)
+            finally:
+                agent.close()
+
     def test_good_token_200(self):
         status, body = self.agent.get("/view?vault=alice", headers={"X-View-Token": "sekrit"})
         self.assertEqual(status, 200)
@@ -240,6 +286,57 @@ class TestTokenGate(unittest.TestCase):
     def test_health_not_gated(self):
         status, _ = self.agent.get("/health")
         self.assertEqual(status, 200)
+
+    def test_unreadable_token_file_fails_closed_503(self):
+        # Point token_file at a DIRECTORY: open() raises an OSError that is NOT
+        # FileNotFoundError on every platform → the gate must fail CLOSED (503),
+        # never silently disarm (review finding).
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "tokdir"))
+            cfg = va.load_config(write_config(d, extra={"token_file": "tokdir"}))
+            agent = AgentHttp(cfg, fake_start_factory())
+            try:
+                status, body = agent.get("/view?vault=alice",
+                                         headers={"X-View-Token": "whatever"})
+                self.assertEqual(status, 503)
+                self.assertIn("token", body["error"])
+            finally:
+                agent.close()
+
+
+class TestPerVaultLocking(unittest.TestCase):
+    def test_cold_start_of_one_vault_does_not_block_another(self):
+        # Review finding: a single global lock serialized every request behind one
+        # vault's cold start (up to url_wait_s). With per-vault locks, a warm/fast
+        # vault must answer while another vault's tunnel is still starting.
+        with tempfile.TemporaryDirectory() as d:
+            cfg = va.load_config(
+                write_config(
+                    d,
+                    vaults={
+                        "slow": {"gui_url": "http://127.0.0.1:3001"},
+                        "fast": {"gui_url": "http://127.0.0.1:3002"},
+                    },
+                )
+            )
+
+            def start(vault_name, vault_cfg):
+                if vault_name == "slow":
+                    time.sleep(1.5)
+                return {"proc": FakeProc(),
+                        "url": "https://%s.trycloudflare.com" % vault_name,
+                        "last": time.time()}
+
+            tm = va.TunnelManager(cfg, start_fn=start)
+            threading.Thread(
+                target=tm.ensure, args=("slow", cfg["vaults"]["slow"]), daemon=True
+            ).start()
+            time.sleep(0.2)  # let the slow cold start grab its vault lock
+            t0 = time.time()
+            url = tm.ensure("fast", cfg["vaults"]["fast"])
+            elapsed = time.time() - t0
+            self.assertEqual(url, "https://fast.trycloudflare.com")
+            self.assertLess(elapsed, 1.0, "fast vault must not wait behind slow's cold start")
 
 
 class TestReaper(unittest.TestCase):
