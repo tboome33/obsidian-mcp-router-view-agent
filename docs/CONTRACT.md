@@ -58,8 +58,9 @@ Transport errors and timeouts are treated like 5xx (transient).
 ## Timing expectations
 
 - A **warm** target (tunnel/session already up) should answer **well under 1 s** — the eager path rides on every note write.
-- A **cold** start may take ~15–18 s (cloudflared handshake). That exceeds the 6 s eager timeout: the write then carries a `viewLinkError` instead of a link, and the next call (or an explicit `get_view_link`, 25 s budget) gets the now-warm tunnel. This is expected and acceptable.
+- A **cold** start may take ~15–25 s (cloudflared handshake **plus edge registration** — see below). That exceeds the 6 s eager timeout: the write then carries a `viewLinkError` instead of a link, and the next call (or an explicit `get_view_link`, 25 s budget) gets the now-warm tunnel. This is expected and acceptable.
 - Keep targets warm with a generous idle window (the reference default is 1800 s) so at most the **first** link of a conversation pays the cold start.
+- **The returned `url` MUST be routable when returned.** cloudflared prints the quick-tunnel URL on *allocation*, seconds before the edge actually *registers* the connection — a user clicking inside that window gets Cloudflare error 1033 (field bug, 2026-06-10). The reference implementation waits for the local `Registered tunnel connection` log line (config `register_wait_s`, default 30 s, + `register_grace_s`, default 1.5 s) before returning. Providers must NOT readiness-probe the public URL from the host instead: an egress quirk (e.g. broken IPv6) turns the probe into a false judge that kills healthy tunnels.
 
 ## Health endpoint (optional, recommended)
 

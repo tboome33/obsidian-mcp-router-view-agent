@@ -215,22 +215,49 @@ class TunnelManager:
             stderr=subprocess.STDOUT,
         )
         deadline = time.time() + self.cfg["url_wait_s"]
+        url = None
         while time.time() < deadline:
             try:
                 with open(log_path, encoding="utf-8", errors="replace") as f:
                     m = TUNNEL_URL_RX.search(f.read())
                 if m:
-                    return {"proc": proc, "url": m.group(0), "last": time.time()}
+                    url = m.group(0)
+                    break
             except OSError:
                 pass
             if proc.poll() is not None:
                 break  # cloudflared died — no point waiting out the deadline
             time.sleep(0.5)
+        # cloudflared prints the URL on ALLOCATION, then takes seconds more to actually
+        # REGISTER the connection on the edge — clicking the URL in that window serves
+        # Cloudflare error 1033 (field bug, 2026-06-10; widened further on hosts with
+        # broken IPv6 egress, where the first connection attempt fails before the IPv4
+        # retry). "Registered tunnel connection" in the LOCAL log is the reliable
+        # readiness signal — never probe the public URL from this host (an egress quirk
+        # would turn the probe into a false judge that kills healthy tunnels).
+        if url is not None and self._wait_registered(log_path, proc):
+            return {"proc": proc, "url": url, "last": time.time()}
         try:
             proc.terminate()
         except Exception:
             pass
         return None
+
+    def _wait_registered(self, log_path, proc):
+        """Wait for cloudflared's edge registration, plus a short propagation grace."""
+        deadline = time.time() + self.cfg.get("register_wait_s", 30)
+        while time.time() < deadline:
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    if "Registered tunnel connection" in f.read():
+                        time.sleep(self.cfg.get("register_grace_s", 1.5))
+                        return True
+            except OSError:
+                pass
+            if proc.poll() is not None:
+                return False  # died before registering
+            time.sleep(0.5)
+        return False
 
     def ensure(self, vault_name, vault_cfg):
         """Return the public URL for this vault's tunnel, starting one if needed.

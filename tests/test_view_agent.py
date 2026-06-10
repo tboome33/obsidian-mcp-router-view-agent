@@ -353,6 +353,53 @@ class TestReaper(unittest.TestCase):
             self.assertEqual(tm.reap_once(), ["alice"])
 
 
+class _FakeProc:
+    """poll() returns None (alive) or a code (dead)."""
+    def __init__(self, alive=True):
+        self._alive = alive
+    def poll(self):
+        return None if self._alive else 0
+
+
+class TestWaitRegistered(unittest.TestCase):
+    """cloudflared prints the tunnel URL on ALLOCATION, seconds before the edge can
+    actually route it (Cloudflare error 1033 in that window — field bug 2026-06-10).
+    _wait_registered() watches the LOCAL log for "Registered tunnel connection"
+    instead of probing the public URL (a host egress quirk — e.g. broken IPv6 —
+    would make a remote probe a false judge that kills healthy tunnels)."""
+
+    def _tm(self, d, register_wait_s=2, register_grace_s=0):
+        cfg = va.load_config(write_config(d, extra={
+            "register_wait_s": register_wait_s, "register_grace_s": register_grace_s,
+        }))
+        return va.TunnelManager(cfg, start_fn=fake_start_factory())
+
+    def test_registered_line_means_ready(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "cf.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write("INF Registered tunnel connection connIndex=0\n")
+            self.assertTrue(self._tm(d)._wait_registered(log, _FakeProc(alive=True)))
+
+    def test_unregistered_times_out_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "cf.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write("INF tunnel URL allocated, still connecting...\n")
+            self.assertFalse(
+                self._tm(d, register_wait_s=1)._wait_registered(log, _FakeProc(alive=True))
+            )
+
+    def test_dead_proc_short_circuits_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "cf.log")
+            open(log, "w").close()
+            t0 = time.time()
+            ok = self._tm(d, register_wait_s=30)._wait_registered(log, _FakeProc(alive=False))
+            self.assertFalse(ok)
+            self.assertLess(time.time() - t0, 5, "died -> returns fast, not after the full wait")
+
+
 class TestNavigate(unittest.TestCase):
     def test_navigate_posts_open_with_bearer(self):
         seen = {}
