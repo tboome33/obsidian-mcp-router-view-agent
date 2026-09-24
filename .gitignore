@@ -1,6 +1,7 @@
 # Real deployment config + secrets — NEVER commit these.
 config.json
 view-agent.token
+link.secret
 secrets/
 
 # Runtime noise

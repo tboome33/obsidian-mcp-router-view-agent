@@ -1,0 +1,38 @@
+{
+  "_comment": "view-agent-direct config. Copy to config.json and adapt. Secrets stay in files, never in this JSON.",
+
+  "bind": "192.0.2.10",
+  "_bind": "A PRIVATE interface (loopback or VPN/WireGuard IP) — never a public one. Firewall the port to that network.",
+
+  "port": 27200,
+
+  "self_url": "http://192.0.2.10:27200",
+  "_self_url": "Base URL under which the READER'S BROWSER reaches this agent (composes the /go links).",
+
+  "token_file": "view-agent.token",
+  "_token_file": "Shared with the router: same value as OBSIDIAN_ROUTER_VIEW_AGENT_TOKEN. openssl rand -hex 24 > view-agent.token",
+
+  "link_secret_file": "link.secret",
+  "_link_secret_file": "HMAC secret for /go links. Absent: links are signed with the token. openssl rand -hex 24 > link.secret",
+
+  "link_ttl_s": 0,
+  "_link_ttl_s": "0 = links in the chat history stay valid indefinitely. > 0 = /go answers 410 after that many seconds.",
+
+  "navigate_on_view": false,
+  "_navigate_on_view": "true would make Obsidian jump to every note the router writes; false = navigate on click only.",
+
+  "vaults": {
+    "alice": {
+      "public_url": "https://192.0.2.10:3001/",
+      "_public_url": "The GUI as the reader's browser sees it (e.g. Selkies). Redirect target after navigation.",
+
+      "open_mode": "docker-exec",
+      "container": "obsidian-alice",
+      "_container": "Real container name: deploy/preflight-direct.sh prints it.",
+      "open_port": 27180,
+      "_open_port": "Local REST API insecurePort INSIDE the container (the preflight confirms it).",
+
+      "_alt_http": "If the container runs with network_mode host, use open_mode http + open_url http://127.0.0.1:27180 instead (the bridge then sees 127.0.0.1)."
+    }
+  }
+}
