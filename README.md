@@ -26,6 +26,18 @@ obsidian-mcp-router (≥ 0.28.0) can hand the user a **read link** whenever the 
 
 Write your own provider instead (different tunneling, a real web app with signed magic links, …) — as long as it honours the contract, the router won't know the difference.
 
+## Two providers — which one?
+
+| | `view-agent.py` (reference) | `view-agent-direct.py` |
+|---|---|---|
+| Use when | the reader **cannot** reach the GUI: it must be exposed on demand | the reader **already** reaches the GUI over a private network (VPN/WireGuard) |
+| Link | `https://user:pass@<random>.trycloudflare.com/`, dies after the idle window | `<agent>/go?…&s=<hmac>`, signed, stable in the chat history (optional TTL) |
+| Navigation | on `/view`, before answering | on click (`/go`), from the container's loopback via `docker exec` |
+| Needs | `cloudflared` | Docker access to the Obsidian container (or a host-network container) |
+| Nothing to type | credentials baked into the URL | the GUI may ask for its own sign-in once |
+
+Both speak the same [contract](docs/CONTRACT.md) on the same port: the router is configured identically for either.
+
 ## Requirements
 
 - Python **3.8+** (stdlib only — no pip dependencies)
@@ -76,6 +88,45 @@ Everything lives in `config.json` (see [config.example.json](config.example.json
 
 Secrets referenced as `*_file` are re-read on every use — rotate them without restarting.
 
+## Direct provider (no tunnel)
+
+`view-agent-direct.py` serves the case where the vault's Obsidian GUI (e.g. a Selkies container) is **already** reachable by the reader over a private network. Instead of opening a tunnel, `/view` returns a signed link to the agent itself; on click, `/go` verifies the signature, navigates Obsidian onto the note and redirects to the GUI. Rationale and contract details: [docs/CONTRACT.md → Providers without a tunnel](docs/CONTRACT.md#providers-without-a-tunnel).
+
+Why `docker exec`: the bridge's `/open` route answers loopback callers only. From the host, a Docker-published port presents the Docker bridge IP, so the call gets `403`. The agent therefore runs `curl http://127.0.0.1:<port>/open/...` **inside** the container. With a host-network container, `open_mode: "http"` calls it directly.
+
+```bash
+# 0. on the host running the Obsidian container — read-only checks, prints config values
+bash deploy/preflight-direct.sh 27180
+
+# 1. install
+sudo useradd -r -s /usr/sbin/nologin -G docker viewagent        # if absent
+sudo mkdir -p /opt/view-agent-direct
+sudo cp view-agent-direct.py /opt/view-agent-direct/
+sudo cp config.direct.example.json /opt/view-agent-direct/config.json   # edit: bind, self_url, vaults
+openssl rand -hex 24 | sudo tee /opt/view-agent-direct/view-agent.token >/dev/null
+openssl rand -hex 24 | sudo tee /opt/view-agent-direct/link.secret >/dev/null
+sudo chown -R viewagent:viewagent /opt/view-agent-direct
+sudo chmod 600 /opt/view-agent-direct/view-agent.token /opt/view-agent-direct/link.secret
+
+# 2. service + firewall (the router's host calls /view, the reader's browser follows /go)
+sudo cp deploy/view-agent-direct.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now view-agent-direct
+sudo ufw allow from <your-vpn-subnet> to any port 27200 proto tcp
+```
+
+Configuration keys beyond the reference's `bind` / `port` / `token_file`:
+
+| Key | Default | Notes |
+|---|---|---|
+| `self_url` | `http://<bind>:<port>` | Base URL under which the **reader's browser** reaches the agent. |
+| `link_secret_file` | `link.secret` | HMAC secret for `/go` links. Absent: signed with the token. Both absent: unsigned. |
+| `link_ttl_s` | `0` | `0` = stable links. `> 0` = `/go` answers `410` after that many seconds, and `/view` reports it as `idle_timeout_s`. |
+| `navigate_on_view` | `false` | `true` also navigates on `/view`, which makes Obsidian jump on every note the router writes. |
+| `vaults.<name>.public_url` | — | The GUI as the reader sees it; redirect target. |
+| `vaults.<name>.open_mode` | `docker-exec` | `docker-exec` (`container`, `open_port`) · `http` (`open_url`) · `none`. |
+
+What the link contains: vault name, note path, optional anchor and expiry, and a signature. No credentials. Following it only navigates and redirects to a GUI that is already private and keeps its own auth.
+
 ## Security model (defence in depth)
 
 1. **Network** — the agent listens on a private interface only; firewall the port to that network (e.g. `ufw allow from <your-vpn-subnet> to any port 27200 proto tcp`).
@@ -91,16 +142,18 @@ What the returned link contains: the GUI's user/password **in the URL** (that's 
 python3 -m unittest discover -s tests -v
 ```
 
-Stdlib-only test suite — boots the real HTTP handler on an ephemeral port with a fake tunnel runner (no cloudflared needed): contract shape, token gate, unknown-vault 400, tunnel reuse, 502 on tunnel failure, idle reaper, `/open` navigation with Bearer auth.
+Stdlib-only test suite — boots the real HTTP handler on an ephemeral port with a fake tunnel runner (no cloudflared needed): contract shape, token gate, unknown-vault 400, tunnel reuse, 502 on tunnel failure, idle reaper, `/open` navigation with Bearer auth. The direct provider's suite uses a fake navigator (no Docker needed): signed-link shape, click-time navigation and redirect, bad signature, signed expiry, escaped failure page.
 
 ## Repo layout
 
 ```
-view-agent.py            the agent (single file, stdlib only)
-config.example.json      documented config template  (copy → config.json)
-docs/CONTRACT.md         the /view provider contract (normative)
-deploy/                  systemd unit + cron launcher
-tests/                   unittest suite (no cloudflared required)
+view-agent.py              the reference agent (single file, stdlib only)
+view-agent-direct.py       the tunnel-less provider (single file, stdlib only)
+config.example.json        documented config template for view-agent.py  (copy → config.json)
+config.direct.example.json documented config template for view-agent-direct.py
+docs/CONTRACT.md           the /view provider contract (normative)
+deploy/                    systemd units, cron launcher, direct-provider preflight
+tests/                     unittest suites (no cloudflared, no Docker required)
 ```
 
 ---
@@ -112,6 +165,8 @@ tests/                   unittest suite (no cloudflared required)
 **Modèle provider** — le router ne dépend QUE du contrat HTTP documenté dans [docs/CONTRACT.md](docs/CONTRACT.md) (`GET /view?vault=&note=` → `{"url": …}`), pas de cette implémentation. Ce dépôt en est *un* fournisseur possible ; écrivez le vôtre (autre tunneling, web app à magic-links signés…) et le router n'y verra que du feu.
 
 **Sécurité (défense en profondeur)** — ① l'agent n'écoute que sur un réseau **privé** (loopback ou IP VPN/WireGuard, pare-feu sur le port) ; ② **token partagé** optionnel (`view-agent.token` ↔ `OBSIDIAN_ROUTER_VIEW_AGENT_TOKEN`, en-tête `X-View-Token`) pour que seul le router puisse fabriquer des liens ; ③ tunnels **éphémères** à hostname imprévisible ; ④ l'auth basique du GUI reste le dernier verrou. Un lien fabriqué se traite comme un cookie de session.
+
+**Second provider, sans tunnel** — `view-agent-direct.py` sert le cas où le lecteur joint **déjà** le GUI par un réseau privé (WireGuard). `/view` rend un lien **signé HMAC** vers l'agent lui-même (`/go?…`), stable dans l'historique du chat ; au clic, l'agent vérifie la signature, navigue Obsidian sur la note (appel `/open` depuis le loopback du conteneur, par `docker exec`) puis redirige vers le GUI. Aucun identifiant dans le lien. Config : `config.direct.example.json` ; contrôles préalables : `deploy/preflight-direct.sh`.
 
 **Démarrage** — `cp config.example.json config.json` (tout y est commenté), `openssl rand -hex 24 > view-agent.token`, `python3 view-agent.py config.json`, puis côté router : `OBSIDIAN_ROUTER_VIEW_AGENT_URL` + `OBSIDIAN_ROUTER_VIEW_AGENT_TOKEN`. Déploiement durable via systemd ou cron (`deploy/`). Tests : `python3 -m unittest discover -s tests` (sans cloudflared). **Python 3.8+ stdlib uniquement.**
 

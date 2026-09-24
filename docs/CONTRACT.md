@@ -1,6 +1,6 @@
 # The `/view` provider contract
 
-This document is the **normative contract** between [obsidian-mcp-router](https://github.com/tboome33/obsidian-mcp-router) and a *view-link provider*. The router is coupled to **this HTTP contract only** — not to any particular implementation, host, or tunneling technology. `view-agent.py` in this repo is one reference provider (container GUIs + Cloudflare quick tunnels); anything that honours this page can replace it (a future web app could serve signed per-note magic links through the very same contract).
+This document is the **normative contract** between [obsidian-mcp-router](https://github.com/tboome33/obsidian-mcp-router) and a *view-link provider*. The router is coupled to **this HTTP contract only** — not to any particular implementation, host, or tunneling technology. This repo ships two providers — `view-agent.py`, the reference (container GUIs + Cloudflare quick tunnels), and `view-agent-direct.py` (signed links to a GUI the reader can already reach, no tunnel; see [Providers without a tunnel](#providers-without-a-tunnel)); anything that honours this page can replace it (a future web app could serve signed per-note magic links through the very same contract).
 
 The router consumes the contract from `src/helpers/view-link.mjs` (`fetchViewLink`), in two modes:
 
@@ -29,7 +29,7 @@ GET {base}/view?vault=<name>&note=<path>
 | Part | Required | Semantics |
 |---|---|---|
 | `vault` (query) | yes | The **canonical vault name** as the router resolved it. The provider decides which vault names it serves. |
-| `note` (query) | no | Vault-relative note path (URL-encoded by the router, e.g. `Voyages%2Ftrip.md`). When present, the provider SHOULD navigate the vault's UI onto that note **before** responding — best-effort: a navigation failure MUST NOT fail the response. |
+| `note` (query) | no | Vault-relative note path (URL-encoded by the router, e.g. `Voyages%2Ftrip.md`). When present, the provider SHOULD make the vault's UI show that note **no later than when the user follows the returned `url`** — either before responding (the reference does) or on click (a provider whose `url` points back at itself). Best-effort: a navigation failure MUST NOT fail the response. |
 | `X-View-Token` (header) | no | Present iff the router instance has `OBSIDIAN_ROUTER_VIEW_AGENT_TOKEN` set. A provider that enforces a token MUST answer `401` on a missing/wrong value. |
 
 The router never sends a body, never uses another method, and never appends extra path segments.
@@ -40,8 +40,8 @@ The router never sends a body, never uses another method, and never appends extr
 
 | Field | Type | Required | Semantics |
 |---|---|---|---|
-| `url` | string, non-empty | **yes** | A **browser-ready** URL the user can click with nothing to type. If the target UI is behind basic-auth, bake the credentials in (`https://user:pass@host/`). This is the only field the router validates. |
-| `idle_timeout_s` | number | recommended | Seconds of inactivity before the link dies. Echoed by `get_view_link` as `expiresInSeconds`. |
+| `url` | string, non-empty | **yes** | A **browser-ready** URL the user can click with nothing to type. If the target UI is behind basic-auth, bake the credentials in (`https://user:pass@host/`). A provider MAY return a URL that is only routable from the private network the reader is on (VPN/WireGuard), and MAY leave a single GUI sign-in prompt to the GUI itself when it holds no credentials to bake in. This is the only field the router validates. |
+| `idle_timeout_s` | number | recommended | Seconds before the link dies (inactivity window for a tunnel, fixed lifetime for a signed link). Echoed by `get_view_link` as `expiresInSeconds`. **Omit it** when the link does not expire — never send a value that would announce a false expiry. |
 | *anything else* | — | no | Ignored by the router (the reference impl also returns `raw_url`, `vault`, `note` for debugging). |
 
 ## Error responses
@@ -74,8 +74,19 @@ Not used by the router; useful for cron-based crash recovery and monitoring (the
 
 1. **Listen on a private network only** (loopback or a VPN/WireGuard interface) and firewall the port accordingly. The router reaches you over that private hop.
 2. **Support the token gate** so that only the router — not every host on the private network — can mint links.
-3. **Keep links ephemeral**: unguessable hostnames + idle expiry. A provider must never turn a vault UI into a permanently exposed service.
+3. **Keep exposure ephemeral**: what must not last is the *exposure* of the vault UI, not the link itself. A provider that opens a path to the UI (a tunnel) closes it after an idle window, behind an unguessable hostname. A provider whose UI is already private (reachable only over the private network, behind its own auth) MAY return stable links, provided they are signed so that nobody else can forge one. Either way, a provider must never turn a vault UI into a permanently exposed service.
 4. **Never log or echo secrets** (tokens, GUI passwords, API keys) anywhere except inside the returned `url` itself.
+
+## Providers without a tunnel
+
+When the reader can already reach the vault's GUI over the private network (e.g. a web-streamed Obsidian over WireGuard), a tunnel adds nothing. `view-agent-direct.py` shows the pattern:
+
+- `/view` returns a link **to the provider itself**, `{self_url}/go?v=<vault>&n=<note>[&h=<anchor>][&e=<exp>]&s=<sig>`, where `sig` is an HMAC-SHA256 over vault, note, anchor and expiry. Minting is pure computation, so it answers well under the 6 s eager budget, and the link stays valid in the chat history (`e` only when a lifetime is configured).
+- On click, `/go` verifies the signature in constant time, navigates Obsidian, then answers `302` to the GUI. A failed navigation yields an explicit error page with a link to the GUI, never a silent redirect.
+- Navigation calls the bridge's `/open` route **from the loopback of the machine or container that runs Obsidian** (`docker exec <container> curl http://127.0.0.1:<port>/open/...`). The route is loopback-only by design, and a Docker-published port presents the Docker bridge IP instead of loopback, so calling it from the host gets `403`.
+- Navigating on click rather than on `/view` is what the relaxed `note` rule above allows: the eager path calls `/view` on every note write, and navigating there would make Obsidian jump on each write.
+
+The reader's browser must reach the provider (it follows `/go`), so the private-network and firewall rule covers the reader's machine as well as the router's host.
 
 ## Worked example
 
