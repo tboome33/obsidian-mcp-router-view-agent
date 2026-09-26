@@ -728,7 +728,7 @@ class TestDetectContainer(DetectBase):
         releaser = threading.Timer(0.3, inv.lock.release)
         releaser.start()
         try:
-            with self.assertRaises(va.DetectError):
+            with self.assertRaises(va.BudgetExhausted):
                 inv.containers(deadline=time.monotonic() + 0.35)   # …acquired too late
         finally:
             releaser.join()
@@ -745,10 +745,44 @@ class TestDetectContainer(DetectBase):
                 raise va.subprocess.TimeoutExpired(cmd, timeout)
             return self.docker(cmd, timeout)
         inv = va.DockerInventory(detect, runner)
-        with self.assertRaises(va.DetectError):
+        with self.assertRaises(va.BudgetExhausted):
             inv.containers(deadline=time.monotonic() + 1.0)
         state["slow"] = False
         self.assertTrue(inv.containers())
+
+    def test_budget_exhaustion_keeps_a_cached_success_and_a_cached_failure(self):
+        detect = dict(self.cfg["detect"], cache_s=10)
+        inv = va.DockerInventory(detect, self.docker)
+        inv.containers()                                     # cached success
+        before = (inv.data, inv.error, inv.at)
+        with self.assertRaises(va.BudgetExhausted):
+            inv.containers(fresh=True, deadline=time.monotonic())
+        self.assertEqual((inv.data, inv.error, inv.at), before)
+        self.docker.raises = OSError("docker gone")
+        with self.assertRaises(va.DetectError):
+            inv.containers(fresh=True)                       # cached failure
+        before = (inv.data, inv.error, inv.at)
+        self.assertIsNotNone(inv.error)
+        with self.assertRaises(va.BudgetExhausted):
+            inv.containers(fresh=True, deadline=time.monotonic())
+        self.assertEqual((inv.data, inv.error, inv.at), before)
+
+    def test_a_full_length_docker_timeout_is_a_cached_docker_failure(self):
+        detect = dict(self.cfg["detect"], cache_s=10)
+        calls = []
+
+        def runner(cmd, timeout=None):
+            calls.append(timeout)
+            raise va.subprocess.TimeoutExpired(cmd, timeout)
+        inv = va.DockerInventory(detect, runner)
+        with self.assertRaises(va.DetectError) as ctx:
+            inv.containers()                                 # full budget: 2.5 s allotted
+        self.assertNotIsInstance(ctx.exception, va.BudgetExhausted)
+        self.assertEqual(calls, [va.DOCKER_CALL_S])
+        self.assertIs(inv.error, ctx.exception)              # a real Docker failure is cached…
+        with self.assertRaises(va.DetectError):
+            inv.containers()
+        self.assertEqual(len(calls), 1)                      # …and answered without Docker
 
     def test_detected_vault_without_note_gets_a_signed_checked_link(self):
         data, path = self.mint("vault=notes&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
