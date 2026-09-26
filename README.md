@@ -94,6 +94,16 @@ Secrets referenced as `*_file` are re-read on every use — rotate them without 
 
 **Desktop vaults** (`open_mode: "obsidian-uri"`): a vault served by the reader's own desktop Obsidian has no web GUI and cannot be driven from the agent's host (the bridge's `/open` is loopback-only on that machine). `/go` then verifies the signature and path and answers `302 obsidian://open?vault=<obsidian_vault>&file=<note>`: the reader's Obsidian opens the note itself. Only useful from the machine where that Obsidian runs; the heading anchor is not carried (`obsidian://open` has no heading parameter).
 
+**Vault detection** (`detect`): a vault missing from `vaults` is classified from two optional hints the router adds to `/view` ([contract → Vault hints](docs/CONTRACT.md#vault-hints)): `rest`, the vault's Local REST API origin as the router reaches it, and `obsidian_name`, its label in Obsidian.
+
+| The `rest` host is… | Classification |
+|---|---|
+| this agent's host (loopback, `bind`, the `self_url` host, `detect.local_hosts`) | the **one** running container publishing that port → `docker-exec` on it (by hex container ID, on the container-side port) + redirect to the host port publishing its GUI (`detect.gui_container_ports`, URL from `detect.gui_url`) |
+| in `detect.desktop_hosts` (IP, CIDR or name) | `obsidian-uri` with `obsidian_name` (required) |
+| anything else, or the hints are missing/invalid | explicit `4xx`, no link |
+
+Rules: a `vaults` entry always wins; detection needs both `token_file` and a signing secret; the hints travel in the `/go` link under its signature, and `/go` classifies again on click (a recreated container is found, a stopped one gets an explicit error page). Docker is queried only with `docker ps --no-trunc -q` and `docker inspect --type container <ids>`, where every ID is checked to be 64 hex digits first; the inventory is cached `detect.cache_s` seconds (default 10). No port published on the right host, two containers on one port, no GUI port, a remote host not listed: all are `400` with the reason. Docker unreachable is `503`.
+
 Why `docker exec`: the bridge's `/open` route answers loopback callers only. From the host, a Docker-published port presents the Docker bridge IP, so the call gets `403`. The agent therefore runs `curl http://127.0.0.1:<port>/open/...` **inside** the container. With a host-network container, `open_mode: "http"` calls it directly.
 
 ```bash
@@ -127,6 +137,14 @@ Configuration keys beyond the reference's `bind` / `port` / `token_file`:
 | `vaults.<name>.public_url` | — | The GUI as the reader sees it; redirect target. |
 | `vaults.<name>.open_mode` | `docker-exec` | `docker-exec` (`container`, `open_port`) · `http` (`open_url`) · `none` · `obsidian-uri` (`obsidian_vault`; no `public_url`). |
 | `vaults.<name>.obsidian_vault` | — | `obsidian-uri` only: the vault's name as the reader's desktop Obsidian knows it. |
+| `detect.enabled` | `true` | Classify vaults absent from `vaults` from the router's hints. With it, `vaults` may be empty. |
+| `detect.desktop_hosts` | `[]` | Hosts whose vaults open in the reader's desktop Obsidian. Empty = no desktop vault is ever detected. |
+| `detect.local_hosts` | `[]` | Extra names/IPs for this host (loopback, `bind` and the `self_url` host are implied). |
+| `detect.gui_container_ports` | `[3001]` | Container-side GUI port(s), first published one wins. |
+| `detect.gui_url` | `https://{host}:{port}/` | Reader-side GUI URL; `{host}` = the `rest` host (the `self_url` host when that is loopback). |
+| `detect.cache_s` | `10` | Seconds a Docker inventory is reused. |
+
+The `/view` answer also reports `open_mode` and `source` (`config`, `container <name>` or `desktop <host>`) for diagnosis.
 
 What the link contains: vault name, note path, optional anchor and expiry, and a signature. No credentials. Following it only navigates and redirects to a GUI that is already private and keeps its own auth.
 
@@ -145,7 +163,7 @@ What the returned link contains: the GUI's user/password **in the URL** (that's 
 python3 -m unittest discover -s tests -v
 ```
 
-Stdlib-only test suite — boots the real HTTP handler on an ephemeral port with a fake tunnel runner (no cloudflared needed): contract shape, token gate, unknown-vault 400, tunnel reuse, 502 on tunnel failure, idle reaper, `/open` navigation with Bearer auth. The direct provider's suite uses a fake navigator (no Docker needed): signed-link shape, click-time navigation and redirect, bad signature, signed expiry, escaped failure page.
+Stdlib-only test suite — boots the real HTTP handler on an ephemeral port with a fake tunnel runner (no cloudflared needed): contract shape, token gate, unknown-vault 400, tunnel reuse, 502 on tunnel failure, idle reaper, `/open` navigation with Bearer auth. The direct provider's suite uses a fake navigator (no Docker needed): signed-link shape, click-time navigation and redirect, bad signature, signed expiry, escaped failure page — and, with a fake `docker` that records every argv, vault detection: container and desktop classification, manual config first, ambiguity and missing-GUI errors, signed hints, validation of Docker's own output.
 
 ## Repo layout
 
@@ -172,6 +190,8 @@ tests/                     unittest suites (no cloudflared, no Docker required)
 **Second provider, sans tunnel** — `view-agent-direct.py` sert le cas où le lecteur joint **déjà** le GUI par un réseau privé (WireGuard). `/view` rend un lien **signé HMAC** vers l'agent lui-même (`/go?…`), stable dans l'historique du chat ; au clic, l'agent vérifie la signature, navigue Obsidian sur la note (appel `/open` depuis le loopback du conteneur, par `docker exec`) puis redirige vers le GUI. Aucun identifiant dans le lien. Config : `config.direct.example.json` ; contrôles préalables : `deploy/preflight-direct.sh`.
 
 **Vaults de bureau** (`open_mode: "obsidian-uri"`) : un vault servi par l'Obsidian de bureau du lecteur n'a pas de GUI web et ne peut pas être piloté depuis l'hôte de l'agent. `/go` vérifie alors signature et chemin, puis répond `302 obsidian://open?vault=<obsidian_vault>&file=<note>` : c'est l'Obsidian du lecteur qui ouvre la note. Utile seulement depuis la machine où tourne cet Obsidian ; l'ancre de titre n'est pas transmise.
+
+**Détection des vaults** (`detect`) : un vault absent de `vaults` est classé à partir de deux indices optionnels que le router ajoute à `/view` ([contrat → Vault hints](docs/CONTRACT.md#vault-hints)) : `rest`, l'origine de la Local REST API du vault telle que le router la joint, et `obsidian_name`, son nom dans Obsidian. Si l'hôte de `rest` est celui de l'agent (loopback, `bind`, hôte de `self_url`, `detect.local_hosts`), l'agent cherche **le** conteneur en marche qui publie ce port : `docker-exec` sur son ID hexadécimal, port interne, puis redirection vers le port publié de sa GUI (`detect.gui_container_ports`, URL selon `detect.gui_url`). Si l'hôte figure dans `detect.desktop_hosts` (IP, CIDR ou nom), le vault est ouvert dans l'Obsidian de bureau : `obsidian-uri` avec `obsidian_name`, obligatoire. Sinon, ou si les indices manquent ou sont invalides : `400` explicite, jamais de lien deviné. Une entrée `vaults` prime toujours. La détection exige `token_file` et un secret de signature. Les indices voyagent dans le lien `/go` sous sa signature, et `/go` reclasse au clic : un conteneur recréé est retrouvé, un conteneur arrêté donne une page d'erreur explicite. Docker n'est interrogé que par `docker ps --no-trunc -q` puis `docker inspect --type container <ids>`, chaque ID étant d'abord vérifié (64 chiffres hexadécimaux). Deux conteneurs sur un port, pas de port GUI, hôte distant non listé : `400` avec la raison ; Docker injoignable : `503`.
 
 **Démarrage** — `cp config.example.json config.json` (tout y est commenté), `openssl rand -hex 24 > view-agent.token`, `python3 view-agent.py config.json`, puis côté router : `OBSIDIAN_ROUTER_VIEW_AGENT_URL` + `OBSIDIAN_ROUTER_VIEW_AGENT_TOKEN`. Déploiement durable via systemd ou cron (`deploy/`). Tests : `python3 -m unittest discover -s tests` (sans cloudflared). **Python 3.8+ stdlib uniquement.**
 

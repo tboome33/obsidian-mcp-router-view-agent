@@ -30,9 +30,22 @@ GET {base}/view?vault=<name>&note=<path>
 |---|---|---|
 | `vault` (query) | yes | The **canonical vault name** as the router resolved it. The provider decides which vault names it serves. |
 | `note` (query) | no | Vault-relative note path (URL-encoded by the router, e.g. `Voyages%2Ftrip.md`). When present, the provider SHOULD make the vault's UI show that note **no later than when the user follows the returned `url`** — either before responding (the reference does) or on click (a provider whose `url` points back at itself). Best-effort: a navigation failure MUST NOT fail the response. |
+| `rest` (query) | no | *Vault hint.* The origin of the vault's Local REST API **as the router reaches it**: `scheme://host:port`, nothing else (no credentials, no path). See [Vault hints](#vault-hints). |
+| `obsidian_name` (query) | no | *Vault hint.* The vault's name **inside Obsidian**, the label `obsidian://open?vault=` expects (it often differs from the router's canonical name). |
 | `X-View-Token` (header) | no | Present iff the router instance has `OBSIDIAN_ROUTER_VIEW_AGENT_TOKEN` set. A provider that enforces a token MUST answer `401` on a missing/wrong value. |
 
 The router never sends a body, never uses another method, and never appends extra path segments.
+
+### Vault hints
+
+Optional, additive: a provider that does not know them ignores them, and a router that does not send them gets today's behaviour. They let a provider serve a vault nobody declared to it, by classifying it from what the router already knows:
+
+- the router sends only what it holds **without a secret**: the REST origin (never the API key, never userinfo) and the Obsidian label when it knows one;
+- a provider MUST treat hints as claims to classify, never as commands: validate them, never build a command line from them, and answer a **4xx** with an explicit `error` when they do not let it classify the vault — never a guessed link;
+- a provider's own configuration for a vault always wins over the hints;
+- a provider that carries hints into a link it will act on later MUST sign them with the rest of the link.
+
+`view-agent-direct.py` uses `rest` to tell a vault served by a container on its own host (the one container publishing that port) from one opened in a reader's desktop Obsidian (the host is in its `detect.desktop_hosts`), and `obsidian_name` to build the `obsidian://` link for the latter.
 
 ## Success response
 
@@ -85,6 +98,7 @@ When the reader can already reach the vault's GUI over the private network (e.g.
 - On click, `/go` verifies the signature in constant time, navigates Obsidian, then answers `302` to the GUI. A failed navigation yields an explicit error page with a link to the GUI, never a silent redirect.
 - Navigation calls the bridge's `/open` route **from the loopback of the machine or container that runs Obsidian** (`docker exec <container> curl http://127.0.0.1:<port>/open/...`). The route is loopback-only by design, and a Docker-published port presents the Docker bridge IP instead of loopback, so calling it from the host gets `403`.
 - Navigating on click rather than on `/view` is what the relaxed `note` rule above allows: the eager path calls `/view` on every note write, and navigating there would make Obsidian jump on each write.
+- For a vault it was not configured with, the [vault hints](#vault-hints) travel in the link (`&r=…&o=…`) under the same signature, and `/go` classifies the vault again on click, so a recreated container is found again and a vanished one gets an explicit error page.
 
 The reader's browser must reach the provider (it follows `/go`), so the private-network and firewall rule covers the reader's machine as well as the router's host.
 
