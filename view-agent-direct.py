@@ -12,7 +12,8 @@ straight to `/open` clicked from another machine gets `403 loopback only`.
 What it does
 ------------
     GET /view?vault=<name>&note=<vault-relative-path>
-      returns {"url": "<self_url>/go?v=<vault>&n=<note>[&h=<anchor>][&e=<exp>]&s=<sig>"}
+      returns {"url": "<self_url>/go?v=<vault>&n=<note>[&h=<anchor>][&e=<exp>][&r=<rest>][&o=<name>]&s=<sig>"}
+      (r/o: the router's vault hints, for a detected vault — see "Vault detection")
       — a link to THIS agent, HMAC-signed, pure computation (no navigation, no I/O), and
       stable in the chat history unless `link_ttl_s` is set.
 
@@ -135,6 +136,7 @@ VAULT_OPTIONAL = (
     "open_url",           # http: Local REST API base URL (the bridge must see the call as loopback)
     "docker_path",        # docker-exec: docker binary (default "docker")
     "curl_path",          # docker-exec: curl binary INSIDE the container (default "curl")
+    "open_scheme",        # docker-exec: "http" (default) | "https" (the REST API's TLS port, curl -k)
 )
 
 
@@ -174,6 +176,8 @@ def load_config(path):
             raise ValueError('vault "%s": open_mode obsidian-uri requires "obsidian_vault"' % name)
         if mode == "docker-exec" and not (v.get("container") and v.get("open_port")):
             raise ValueError('vault "%s": open_mode docker-exec requires "container" and "open_port"' % name)
+        if v.get("open_scheme", "http") not in ("http", "https"):
+            raise ValueError('vault "%s": open_scheme must be http or https' % name)
         if mode == "http" and not v.get("open_url"):
             raise ValueError('vault "%s": open_mode http requires "open_url"' % name)
     if not isinstance(cfg.get("port"), int):
@@ -226,8 +230,16 @@ def _load_detect(raw):
     desktop = []
     for h in d["desktop_hosts"]:
         try:
-            desktop.append(ipaddress.ip_network(h.strip(), strict=False))
+            net = ipaddress.ip_network(h.strip(), strict=False)
         except ValueError:
+            net = None
+        if net is not None:
+            if net.version == 6 and net.subnet_of(ipaddress.ip_network("::ffff:0:0/96")):
+                if net.prefixlen != 128:
+                    raise ValueError('detect.desktop_hosts: write "%s" in IPv4 notation' % h)
+                net = ipaddress.ip_network(_norm_host(str(net.network_address)))  # hints are normalized too
+            desktop.append(net)
+        else:
             n = _norm_host(h)
             if not _HOSTNAME_RE.match(n):
                 raise ValueError('detect.desktop_hosts: "%s" is neither an IP, a CIDR nor a host name' % h)
@@ -601,7 +613,10 @@ class DockerInventory:
 
 
 def _reachable(bind_ip, host):
-    return bind_ip in _WILDCARD_IPS or bind_ip == host
+    if bind_ip in _WILDCARD_IPS or bind_ip == host:
+        return True
+    # Docker reports an IP; "localhost" is how a router on this host may spell loopback.
+    return host == "localhost" and bind_ip in ("127.0.0.1", "::1")
 
 
 def _detect_container(cfg, host, port, inventory):
@@ -717,16 +732,24 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
             self.end_headers()
             self.wfile.write(body)
 
+        def send_response(self, *a, **k):
+            self._started = True
+            BaseHTTPRequestHandler.send_response(self, *a, **k)
+
         def log_message(self, *a):
             pass
 
         def do_GET(self):
+            self._started = False
             try:
                 return self._get()
+            except (BrokenPipeError, ConnectionResetError):
+                return  # the client left: nothing to answer
             except Exception as e:  # never a dropped connection: the router reads that as transport
                 print("view-agent-direct: unexpected %s on %s" % (type(e).__name__, self.path.split("?")[0]),
                       file=sys.stderr)
-                return self._send(500, {"error": "internal error"})
+                if not self._started:  # a second status line would corrupt a started response
+                    return self._send(500, {"error": "internal error"})
 
         def _get(self):
             u = urllib.parse.urlparse(self.path)

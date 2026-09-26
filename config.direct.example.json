@@ -44,6 +44,8 @@
       "container": "obsidian-alice",
       "_container": "Real container name: deploy/preflight-direct.sh prints it.",
       "open_port": 27180,
+      "open_scheme": "http",
+      "_open_scheme": "https when open_port is the Local REST API's TLS port (curl -k on the container's loopback).",
       "_open_port": "Local REST API insecurePort INSIDE the container (the preflight confirms it).",
 
       "_alt_http": "If the container runs with network_mode host, use open_mode http + open_url http://127.0.0.1:27180 instead (the bridge then sees 127.0.0.1)."

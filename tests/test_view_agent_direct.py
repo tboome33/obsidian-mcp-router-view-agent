@@ -463,6 +463,19 @@ class TestDetectContainer(DetectBase):
         data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
         self.assertEqual(data["source"], "container obs")
 
+    def test_localhost_hint_matches_a_loopback_binding(self):
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("127.0.0.1", 27180)],
+                                                          "3001/tcp": [("0.0.0.0", 3001)]})]
+        data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://localhost:27180"))
+        self.assertEqual(data["source"], "container obs")
+
+    def test_configured_vault_wins_even_on_a_signed_hint_link(self):
+        hints = {"rest": "http://192.0.2.1:27180"}
+        link = va.build_go_link(self.cfg, "alice", "a.md", "", hints)   # signed v2, vault configured
+        code, headers, _ = self.get(link.split("agent.test:27200", 1)[-1])
+        self.assertEqual(headers["Location"], "https://gui.test:3001/")
+        self.assertEqual(self.docker.cmds, [])
+
     def test_ipv4_mapped_local_address_is_local(self):
         data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://[::ffff:192.0.2.1]:27180"))
         self.assertEqual(data["source"], "container obsidian-notes")
@@ -597,6 +610,12 @@ class TestDetectPure(unittest.TestCase):
         self.assertTrue(va._host_in("pc.wg", nets))
         self.assertFalse(va._host_in("::1", nets))
 
+    def test_ipv4_mapped_desktop_host_matches_the_normalized_hint(self):
+        nets = va._load_detect({"desktop_hosts": ["::ffff:10.0.0.5"]})["_desktop"]
+        self.assertTrue(va._host_in(va.parse_rest_hint("http://10.0.0.5:1")[1], nets))
+        with self.assertRaises(ValueError):
+            va._load_detect({"desktop_hosts": ["::ffff:10.0.0.0/120"]})
+
     def test_detect_config_validation(self):
         for bad in ({"desktop_hosts": ["not a host!"]}, {"gui_url": "https://{host.__class__}:{port}/"},
                     {"gui_url": "https://x/"}, {"gui_url": "file:///{port}"}, {"bogus": 1},
@@ -611,6 +630,11 @@ class TestDetectPure(unittest.TestCase):
             p = os.path.join(d, "config.json")
             with open(p, "w") as f:
                 json.dump({"bind": "192.0.2.1", "vaults": {}, "detect": {"desktop_hosts": ["192.0.2.0/24"]}}, f)
+            with self.assertRaises(ValueError):
+                va.load_config(p)
+            with open(p, "w") as f:
+                json.dump({"vaults": {"a": {"public_url": "u", "container": "c", "open_port": 1,
+                                            "open_scheme": "ftp"}}}, f)
             with self.assertRaises(ValueError):
                 va.load_config(p)
             with open(p, "w") as f:  # detection lets "vaults" be empty; disabling it does not

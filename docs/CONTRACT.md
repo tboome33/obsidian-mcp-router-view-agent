@@ -41,7 +41,7 @@ The router never sends a body, never uses another method, and never appends extr
 Optional, additive: a provider that does not know them ignores them, and a router that does not send them gets today's behaviour. They let a provider serve a vault nobody declared to it, by classifying it from what the router already knows:
 
 - the router sends only what it holds **without a secret**: the REST origin (never the API key, never userinfo) and the Obsidian label when it knows one;
-- a provider MUST treat hints as claims to classify, never as commands: validate them, never build a command line from them, and answer a **4xx** with an explicit `error` when they do not let it classify the vault — never a guessed link;
+- a provider MUST treat hints as claims to classify, never as commands: validate them, never put them into a command line (at most map a validated value onto a fixed choice, such as the scheme picking `http` or `https`), and answer a **4xx** with an explicit `error` when they do not let it classify the vault — never a guessed link;
 - a provider's own configuration for a vault always wins over the hints;
 - a provider that carries hints into a link it will act on later MUST sign them with the rest of the link.
 

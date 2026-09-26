@@ -36,7 +36,7 @@ fi
 info "published ports (detect.gui_container_ports must name the GUI's container-side port):"
 docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{$p}} <- {{.HostIp}}:{{.HostPort}}  {{end}}{{end}}' "$C" | tr -s ' ' '\n' | paste -d' ' - - - | sed 's/^/         /'
 N=$(docker ps --format '{{.Ports}}' | grep -c ":$PORT->")
-[ "$N" -gt 1 ] && ko "$N containers publish $PORT: detection will refuse it as ambiguous"
+[ "$N" -gt 1 ] && info "$N containers publish $PORT: detection refuses it unless their host IPs differ"
 
 echo "== 2. curl available inside the container"
 if docker exec "$C" sh -c 'command -v curl' >/dev/null 2>&1; then ok "curl present"; else ko "curl missing in $C (install it, or set curl_path)"; fi
@@ -44,6 +44,11 @@ if docker exec "$C" sh -c 'command -v curl' >/dev/null 2>&1; then ok "curl prese
 echo "== 3. Bridge /open route, seen from the container's loopback"
 CODE=$(docker exec "$C" curl -sS -o /dev/null -w '%{http_code}' --max-time 4 "http://127.0.0.1:$INNER/open/__preflight_missing__.md" 2>/dev/null)
 CODE="${CODE:-000}"
+if [ "$CODE" = 000 ]; then  # perhaps the REST API's TLS port: open_scheme "https"
+  CODE=$(docker exec "$C" curl -sSk -o /dev/null -w '%{http_code}' --max-time 4 "https://127.0.0.1:$INNER/open/__preflight_missing__.md" 2>/dev/null)
+  CODE="${CODE:-000}"
+  [ "$CODE" != 000 ] && info "port $INNER answers over https → open_scheme \"https\""
+fi
 case "$CODE" in
   404) ok "HTTP 404: /open is registered and the loopback guard is satisfied" ;;
   403) ko "HTTP 403: the call is not seen as loopback (bindingHost? proxy?)" ;;
