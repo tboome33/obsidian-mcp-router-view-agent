@@ -495,10 +495,11 @@ _VAULT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 def _mounts_identity(o):
-    """A container's vault identity: a digest of what it mounts (bind sources, named
-    volumes). Stable across `docker compose` recreations and image updates (unlike the
-    container ID); different when another vault is mounted under the same container name.
-    None when the container mounts nothing (then it holds no vault to identify)."""
+    """A container's vault identity: a digest of WHAT it mounts WHERE (bind source or named
+    volume, each with its destination and volume subpath). Stable across `docker compose`
+    recreations and image updates (unlike the container ID); different when another folder
+    is mounted, or the same folders are swapped between destinations. It proves what Docker
+    mounts where, not the vault's content. None when the container mounts nothing."""
     mounts = o.get("Mounts")
     srcs = set()
     for m in (mounts if isinstance(mounts, list) else ()):
@@ -506,8 +507,14 @@ def _mounts_identity(o):
             continue
         kind = m.get("Type")
         src = m.get("Name") if kind == "volume" else m.get("Source") if kind == "bind" else None
-        if isinstance(src, str) and src and _printable(src, 4096):
-            srcs.add("%s:%s" % (kind, src))
+        dest = m.get("Destination")
+        vopts = m.get("VolumeOptions") if isinstance(m.get("VolumeOptions"), dict) else {}
+        sub = vopts.get("Subpath") or ""
+        if (isinstance(src, str) and src and _printable(src, 4096)
+                and isinstance(dest, str) and dest and _printable(dest, 4096)
+                and isinstance(sub, str) and (not sub or _printable(sub, 4096))):
+            # JSON of each triple: no separator can be forged inside a path.
+            srcs.add(json.dumps([kind, src, sub, dest], ensure_ascii=True))
     if not srcs:
         return None
     return hashlib.sha256("\n".join(sorted(srcs)).encode("utf-8")).hexdigest()[:16]

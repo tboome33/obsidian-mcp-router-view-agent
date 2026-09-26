@@ -534,6 +534,43 @@ class TestDetectContainer(DetectBase):
         self.assertNotIn("Location", headers)
         self.assertEqual(self.calls, [])
 
+    def _takeover(self, mounts):
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.docker.containers = [container("e" * 64, "obsidian-notes", {
+            "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}, mounts=mounts)]
+        return self.get(path)
+
+    def test_swapped_destinations_are_another_vault(self):
+        a = {"Type": "bind", "Source": "/srv/a", "Destination": "/vault"}
+        b = {"Type": "bind", "Source": "/srv/b", "Destination": "/backup"}
+        self.docker.containers = [container(ID_A, "obsidian-notes", {
+            "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}, mounts=[a, b])]
+        code, headers, _ = self._takeover([dict(a, Destination="/backup"), dict(b, Destination="/vault")])
+        self.assertEqual(code, 409)
+        self.assertNotIn("Location", headers)
+        self.assertEqual(self.calls, [])
+
+    def test_mount_order_does_not_change_the_identity(self):
+        a = {"Type": "bind", "Source": "/srv/a", "Destination": "/vault"}
+        b = {"Type": "volume", "Name": "notes-config", "Destination": "/config"}
+        self.docker.containers = [container(ID_A, "obsidian-notes", {
+            "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}, mounts=[a, b])]
+        code, _, _ = self._takeover([b, a])                             # recreated, order shuffled
+        self.assertEqual(code, 302)
+
+    def test_another_named_volume_is_another_vault(self):
+        v = {"Type": "volume", "Name": "notes-data", "Destination": "/vault"}
+        self.docker.containers = [container(ID_A, "obsidian-notes", {
+            "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}, mounts=[v])]
+        self.assertEqual(self._takeover([dict(v, Name="eve-data")])[0], 409)
+
+    def test_identity_fields_sent_to_view_are_ignored(self):
+        data, _ = self.mint("vault=notes&note=a.md&container=evil&vault_id=" + "0" * 16
+                            + "&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)
+        self.assertEqual(q["c"], ["obsidian-notes"])
+        self.assertNotEqual(q["k"], ["0" * 16])
+
     def test_container_mounting_nothing_is_not_a_vault(self):
         self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("0.0.0.0", 27180)],
                                                           "3001/tcp": [("0.0.0.0", 3001)]}, mounts=[])]
