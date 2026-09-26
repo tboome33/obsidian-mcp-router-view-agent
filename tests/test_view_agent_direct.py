@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -258,9 +259,14 @@ class FakeDocker:
         self.ps_stdout = None       # override `docker ps` output
         self.inspect_stdout = None  # override `docker inspect` output
         self.raises = None          # exception raised by every call (docker missing)
+        self.timeouts = []          # timeout handed to every call
+        self.delay = 0              # seconds each call takes (slow Docker)
 
-    def __call__(self, cmd):
+    def __call__(self, cmd, timeout=None):
         self.cmds.append(list(cmd))
+        self.timeouts.append(timeout)
+        if self.delay:
+            time.sleep(self.delay)
         if self.raises:
             raise self.raises
 
@@ -662,6 +668,59 @@ class TestDetectContainer(DetectBase):
         self.assertEqual(code, 400)
         self.assertIn("also published by b", json.loads(body)["error"])
 
+    def test_gui_port_on_another_containers_explicit_ip_is_indeterminate(self):
+        # A's GUI on 0.0.0.0:3001, B's on [2001:db8::2]:3001; the GUI host is a NAME that may
+        # resolve to B's address: cannot be ruled out.
+        self.docker.containers = [
+            container(ID_A, "a", {"27180/tcp": [("127.0.0.1", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}),
+            container(ID_B, "b", {"3001/tcp": [("2001:db8::2", 3001)]}),
+        ]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://127.0.0.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("indeterminate", json.loads(body)["error"])
+
+    def test_each_docker_call_gets_the_remaining_budget(self):
+        self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(len(self.docker.timeouts), 2)
+        self.assertTrue(all(t is not None and 0 < t <= va.DOCKER_CALL_S for t in self.docker.timeouts))
+
+    def test_concurrent_views_never_wait_past_the_budget(self):
+        old = va.DETECT_BUDGET_S
+        va.DETECT_BUDGET_S = 0.6
+        self.docker.delay = 0.4                   # one probe = 0.8 s > the budget
+        results = []
+
+        def one():
+            t0 = time.monotonic()
+            code = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))[0]
+            results.append((code, time.monotonic() - t0))
+        try:
+            ts = [threading.Thread(target=one) for _ in range(3)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        finally:
+            va.DETECT_BUDGET_S = old
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(elapsed < 1.5 for _, elapsed in results), results)
+        self.assertTrue(all(code in (200, 503) for code, _ in results), results)
+        self.assertIn(503, [code for code, _ in results])      # the budget did cut in
+
+    def test_a_held_inventory_lock_is_not_waited_on_past_the_deadline(self):
+        inv = va.DockerInventory(self.cfg["detect"], self.docker)
+        inv.lock.acquire()                        # another request is probing a slow Docker
+        releaser = threading.Timer(2.0, inv.lock.release)
+        releaser.start()
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(va.DetectError) as ctx:
+                inv.containers(deadline=time.monotonic() + 0.3)
+            self.assertEqual(ctx.exception.code, 503)
+            self.assertLess(time.monotonic() - t0, 1.0)
+        finally:
+            releaser.join()
+
     def test_detected_vault_without_note_gets_a_signed_checked_link(self):
         data, path = self.mint("vault=notes&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
         self.assertEqual(data["kind"], "direct-go")                 # never the raw GUI URL
@@ -803,10 +862,19 @@ class TestDetectDesktop(DetectBase):
         self.assertEqual(code, 400)
         self.assertIn("cannot classify", json.loads(body)["error"])
 
-    def test_desktop_link_without_note_opens_the_vault(self):
-        data, _ = self.mint("vault=carol&rest=" + urllib.parse.quote("http://192.0.2.10:27190")
-                            + "&obsidian_name=V")
-        self.assertEqual(data["url"], "obsidian://open?vault=V")
+    def test_desktop_link_without_note_is_signed_and_rechecked(self):
+        data, path = self.mint("vault=carol&rest=" + urllib.parse.quote("http://192.0.2.10:27190")
+                               + "&obsidian_name=V")
+        self.assertEqual(data["kind"], "direct-go")               # never a raw obsidian:// URI
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 302)
+        self.assertEqual(headers["Location"], "obsidian://open?vault=V")
+        self.assertEqual(self.get(path.replace("o=V", "o=W"))[0], 403)
+
+    def test_configured_desktop_vault_without_note_keeps_its_direct_uri(self):
+        self.cfg["vaults"]["desk"] = {"open_mode": "obsidian-uri", "obsidian_vault": "D", "public_url": ""}
+        code, _, body = self.get("/view?vault=desk", {"X-View-Token": "tok-123"})
+        self.assertEqual((code, json.loads(body)["url"]), (200, "obsidian://open?vault=D"))
 
     def test_desktop_go_still_refuses_traversal(self):
         hints = {"rest": "http://192.0.2.10:27190", "obsidian_name": "V"}
@@ -877,9 +945,14 @@ class TestDetectPure(unittest.TestCase):
         for bad in ({"desktop_hosts": ["not a host!"]}, {"gui_url": "https://{host.__class__}:{port}/"},
                     {"gui_url": "https://x/"}, {"gui_url": "file:///{port}"}, {"bogus": 1},
                     {"gui_container_ports": []}, {"gui_container_ports": [True]}, {"enabled": "yes"},
-                    {"cache_s": -1}, {"local_hosts": "192.0.2.1"}):
+                    {"cache_s": -1}, {"local_hosts": "192.0.2.1"},
+                    # the redirect must land on the host:port the identity check covered
+                    {"gui_url": "https://192.0.2.2:{port}/"}, {"gui_url": "https://proxy.test/{host}/{port}"},
+                    {"gui_url": "https://{host}:{port}@192.0.2.2/"}, {"gui_url": "https://{host}:{port}/?x={host}"}):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 va._load_detect(bad)
+        for good in ("https://{host}:{port}/", "http://{host}:{port}", "https://{host}:{port}/vnc/index.html"):
+            self.assertEqual(va._load_detect({"gui_url": good})["gui_url"], good)
 
     def test_a_host_cannot_be_both_local_and_desktop(self):
         d = tempfile.mkdtemp()

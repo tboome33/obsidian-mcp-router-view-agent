@@ -133,8 +133,9 @@ returns a `viewLink`, and `get_view_link` gives one on demand.
 - A token pasted in a chat is exposed: rotate it.
 - What a detected link guarantees: at click time, the agent re-checks that the same container name with the
   same mounts (what Docker mounts where) answers on that port — before navigating and again right before the
-  redirect — and refuses (`409`) otherwise. A detected vault's GUI address is only ever handed out through such
-  a checked link. It does not prove the vault's content, and a container replaced between that last check and
+  redirect — and refuses (`409`) otherwise. A detected vault (container or desktop) is only ever handed out
+  through such a checked link, even without a note. A click waits at most ~18 s in the worst case (two Docker
+  checks of 5 s each around the navigation), normally well under a second. It does not prove the vault's content, and a container replaced between that last check and
   the moment your browser loads the GUI cannot be caught: keep the GUI's own login.
 
 ## 7. The desktop case, side by side
@@ -247,7 +248,9 @@ Dans l'environnement du serveur MCP (pour Claude Code : le bloc `env` de `~/.cla
 - Un jeton collé dans une conversation est exposé : le changer.
 - Ce que garantit un lien détecté : au clic, l'agent revérifie que le même nom de conteneur, avec les mêmes
   montages (ce que Docker monte où), répond sur ce port — avant de naviguer, puis juste avant la redirection —
-  et refuse (`409`) sinon. L'adresse de la GUI d'un vault détecté n'est donnée que par un tel lien vérifié.
+  et refuse (`409`) sinon. Un vault détecté (conteneur ou bureau) n'est donné que par un tel lien vérifié, même
+  sans note. Un clic attend au pire ~18 s (deux vérifications Docker de 5 s autour de la navigation),
+  normalement bien moins d'une seconde.
   Cela ne prouve pas le contenu du vault, et un conteneur remplacé entre cette dernière vérification et le
   chargement de la GUI par le navigateur ne peut pas être intercepté : garder l'identifiant propre de la GUI.
 

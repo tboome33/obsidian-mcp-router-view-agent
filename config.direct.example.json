@@ -31,7 +31,7 @@
     "gui_container_ports": [3001],
     "_gui_container_ports": "Container-side GUI port(s) (linuxserver/obsidian: 3001 = HTTPS). The host port publishing it becomes the redirect target.",
     "gui_url": "https://{host}:{port}/",
-    "_gui_url": "{host} = host of the rest hint (the self_url host when that is loopback), {port} = published GUI port. No other placeholder.",
+    "_gui_url": "{host} = host of the rest hint (the self_url host when that is loopback), {port} = published GUI port. Must be http(s)://{host}:{port} plus an optional path: no fixed host, no proxy.",
     "cache_s": 10
   },
 

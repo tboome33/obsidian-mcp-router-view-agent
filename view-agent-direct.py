@@ -254,6 +254,10 @@ def _load_detect(raw):
         raise ValueError('detect.gui_url must be an http(s) URL template containing {port}')
     if re.search(r"[{}]", g.replace("{host}", "").replace("{port}", "")):
         raise ValueError('detect.gui_url may only use the {host} and {port} fields')
+    if not re.fullmatch(r"https?://\{host\}:\{port\}(/[^?#]*)?", g):
+        # The identity check covers the host and port the container publishes its GUI on:
+        # the redirect must land exactly there, not on a fixed host or a proxy in front.
+        raise ValueError('detect.gui_url must be http(s)://{host}:{port}/ optionally followed by a path')
     if not isinstance(d["cache_s"], (int, float)) or isinstance(d["cache_s"], bool) or d["cache_s"] < 0:
         raise ValueError('detect.cache_s must be a number >= 0')
     for k in ("docker_path", "curl_path"):
@@ -595,14 +599,20 @@ def normalize_hints(raw):
     return hints
 
 
-def _run(cmd):
-    # Two calls at most per detection: 2 x 2.5 s stays under the router's 6 s eager budget.
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=2.5)
+# One detection — waiting for the inventory lock included — fits in DETECT_BUDGET_S, under the
+# router's 6 s eager budget; each Docker command gets at most DOCKER_CALL_S of what is left.
+DETECT_BUDGET_S = 5.0
+DOCKER_CALL_S = 2.5
+
+
+def _run(cmd, timeout=DOCKER_CALL_S):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
 class DockerInventory:
     """Running containers and their published TCP ports, from two fixed commands:
-    `docker ps --no-trunc -q` then `docker inspect <validated ids>`. Cached `cache_s`."""
+    `docker ps --no-trunc -q` then `docker inspect <validated ids>`. Cached `cache_s`.
+    Every call runs against a deadline: the lock wait and both commands share it."""
 
     def __init__(self, detect_cfg, runner=None):
         self.d = detect_cfg
@@ -612,17 +622,22 @@ class DockerInventory:
         self.data = None
         self.error = None
 
-    def containers(self, fresh=False):
+    def containers(self, fresh=False, deadline=None):
         """`fresh`: bypass the cache — a click (/go) acts on the container, so it must see
-        Docker as it is now, not as it was up to `cache_s` seconds ago."""
-        with self.lock:
+        Docker as it is now, not as it was up to `cache_s` seconds ago. `deadline`
+        (time.monotonic()): default now + DETECT_BUDGET_S; concurrent callers never queue past it."""
+        if deadline is None:
+            deadline = time.monotonic() + DETECT_BUDGET_S
+        if not self.lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise DetectError(503, "docker inventory busy: time budget exhausted")
+        try:
             now = time.monotonic()
             if not fresh and self.data is not None and now - self.at < self.d["cache_s"]:
                 return self.data
             if not fresh and self.error is not None and now - self.at < min(self.d["cache_s"], 5):
                 raise self.error  # Docker down: answer at once rather than queue on the lock
             try:
-                self.data, self.error = self._probe(), None
+                self.data, self.error = self._probe(deadline), None
             except DetectError as e:
                 self.data, self.error = None, e
             except Exception as e:  # malformed output of an unexpected shape: fail closed
@@ -632,16 +647,21 @@ class DockerInventory:
             if self.error is not None:
                 raise self.error
             return self.data
+        finally:
+            self.lock.release()
 
-    def _call(self, args):
+    def _call(self, args, deadline):
+        left = deadline - time.monotonic()
+        if left < 0.1:
+            raise DetectError(503, "docker: time budget exhausted")
         try:
-            r = self.runner([self.d["docker_path"]] + args)
+            r = self.runner([self.d["docker_path"]] + args, min(DOCKER_CALL_S, left))
         except Exception as e:
             raise DetectError(503, "docker unavailable: %s" % str(e)[:120])
         return r
 
-    def _probe(self):
-        r = self._call(["ps", "--no-trunc", "-q"])
+    def _probe(self, deadline):
+        r = self._call(["ps", "--no-trunc", "-q"], deadline)
         if r.returncode != 0:
             raise DetectError(503, "docker ps failed: %s" % (r.stderr or "").strip()[:160])
         ids = [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
@@ -649,7 +669,7 @@ class DockerInventory:
             raise DetectError(503, "docker ps: unexpected output")
         if not ids:
             return []
-        r = self._call(["inspect", "--type", "container"] + ids)
+        r = self._call(["inspect", "--type", "container"] + ids, deadline)
         try:
             objs = json.loads(r.stdout or "")
         except ValueError:
@@ -755,7 +775,11 @@ def _detect_container(cfg, host, port, inventory, fresh=False):
             break
     if gui is not None:
         # The reader's browser will open {gui_host}:{gui}: no OTHER container may answer there,
-        # in either address family, or the redirect could land on another vault.
+        # in either address family, or the redirect could land on another vault. A NAME facing
+        # an explicit-IP publication of that port, by any container, cannot be ruled out.
+        if _name_meets_explicit_ip(gui_host, [hip for o in containers for hip, hp, _ in o["ports"] if hp == gui]):
+            raise DetectError(400, "GUI port %d is published on an explicit address and the GUI host is "
+                                   "the name %s: indeterminate" % (gui, gui_host))
         others = sorted(o["name"] for o in containers if o["id"] != c["id"]
                         and any(hp == gui and _reachable(hip, gui_host) for hip, hp, _ in o["ports"]))
         if others:
@@ -904,12 +928,10 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                                                "vaults": sorted(cfg["vaults"].keys())})
                 if not note:
                     # No note: a link to the GUI (or the desktop vault), nothing to navigate.
-                    if vault_cfg.get("open_mode") == "obsidian-uri":
-                        return self._send(200, {"url": obsidian_uri(vault_cfg), "vault": vault, "kind": "obsidian-uri"})
                     if hints is not None:
-                        # A DETECTED container vault: never hand out its GUI URL raw — the port
-                        # may be reassigned before the click. A signed /go link re-checks the
-                        # identity first, then redirects.
+                        # A DETECTED vault (container or desktop): never an unsigned URL — the
+                        # classification may change before the click. A signed /go link
+                        # re-detects and checks the identity first, then redirects.
                         if _has_line_break(vault, "", anchor):
                             return self._send(400, {"error": "bad anchor"})
                         try:
@@ -918,6 +940,8 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                             return self._send(503, {"error": str(e)})
                         return self._send(200, {"url": link, "vault": vault, "kind": "direct-go",
                                                 "source": vault_cfg.get("_detected", "config")})
+                    if vault_cfg.get("open_mode") == "obsidian-uri":
+                        return self._send(200, {"url": obsidian_uri(vault_cfg), "vault": vault, "kind": "obsidian-uri"})
                     return self._send(200, {"url": vault_cfg["public_url"], "vault": vault, "kind": "direct"})
                 if _safe_note(note) is None or _has_line_break(vault, note, anchor):
                     return self._send(400, {"error": "bad note path"})
