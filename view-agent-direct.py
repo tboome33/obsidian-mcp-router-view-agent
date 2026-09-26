@@ -198,9 +198,11 @@ def load_config(path):
 def _norm_host(h):
     h = str(h).strip().lower().rstrip(".")
     try:
-        return str(ipaddress.ip_address(h.strip("[]")))
+        ip = ipaddress.ip_address(h.strip("[]"))
     except ValueError:
         return h
+    # ::ffff:192.0.2.1 is 192.0.2.1: one spelling, so local/desktop matching cannot be sidestepped.
+    return str(getattr(ip, "ipv4_mapped", None) or ip)
 
 
 _HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)*$")
@@ -418,10 +420,12 @@ def navigate(vault_cfg, note, anchor="", runner=None):
         return (True, "navigation disabled" if mode == "none" else "opened by the reader's Obsidian")
     try:
         if mode == "docker-exec":
-            url = "http://127.0.0.1:%s%s" % (vault_cfg["open_port"], open_path(note, anchor))
+            # https: the Local REST API's secure port, self-signed; -k is harmless on loopback.
+            scheme = "https" if vault_cfg.get("open_scheme") == "https" else "http"
+            url = "%s://127.0.0.1:%s%s" % (scheme, vault_cfg["open_port"], open_path(note, anchor))
             cmd = [vault_cfg.get("docker_path", "docker"), "exec", vault_cfg["container"],
-                   vault_cfg.get("curl_path", "curl"), "-sS", "-o", "/dev/null",
-                   "-w", "%{http_code}", "--max-time", "4", url]
+                   vault_cfg.get("curl_path", "curl"), "-sS"] + (["-k"] if scheme == "https" else []) + [
+                   "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "4", url]
             run = runner or (lambda c: subprocess.run(c, capture_output=True, text=True, timeout=8))
             r = run(cmd)
             code = (r.stdout or "").strip()[-3:]
@@ -463,9 +467,13 @@ def _printable(s, limit):
 def parse_rest_hint(value):
     """Router's `rest` hint → (origin, host, port). Only scheme://host:port is accepted:
     no credentials, no path, no query, an explicit port, a host that is an IP or a name."""
-    if not _printable(value, 300) or " " in value or "\\" in value:
+    if not _printable(value, 300) or any(c in value for c in " \\%"):
         raise DetectError(400, "rest hint: not a plain URL")
-    u = urllib.parse.urlsplit(value)
+    try:
+        u = urllib.parse.urlsplit(value)
+        u.hostname, u.port
+    except ValueError:  # e.g. "http://[::1:80" — urlsplit raises instead of parsing
+        raise DetectError(400, "rest hint: not a valid URL")
     if u.scheme.lower() not in ("http", "https"):
         raise DetectError(400, "rest hint: scheme must be http or https")
     if "@" in u.netloc:
@@ -485,7 +493,7 @@ def parse_rest_hint(value):
         if not _HOSTNAME_RE.match(host):
             raise DetectError(400, "rest hint: invalid host")
     shown = "[%s]" % host if ":" in host else host
-    return ("%s://%s:%d" % (u.scheme.lower(), shown, port), host, port)
+    return ("%s://%s:%d" % (u.scheme.lower(), shown, port), host, port, u.scheme.lower())
 
 
 def normalize_hints(raw):
@@ -515,14 +523,25 @@ class DockerInventory:
         self.lock = threading.Lock()
         self.at = 0.0
         self.data = None
+        self.error = None
 
     def containers(self):
         with self.lock:
             now = time.monotonic()
             if self.data is not None and now - self.at < self.d["cache_s"]:
                 return self.data
-            self.data = self._probe()  # an error propagates and caches nothing
+            if self.error is not None and now - self.at < min(self.d["cache_s"], 5):
+                raise self.error  # Docker down: answer at once rather than queue on the lock
+            try:
+                self.data, self.error = self._probe(), None
+            except DetectError as e:
+                self.data, self.error = None, e
+            except Exception as e:  # malformed output of an unexpected shape: fail closed
+                self.data, self.error = None, DetectError(503, "docker: unexpected output (%s)"
+                                                          % type(e).__name__)
             self.at = now
+            if self.error is not None:
+                raise self.error
             return self.data
 
     def _call(self, args):
@@ -555,22 +574,27 @@ class DockerInventory:
             cid = o.get("Id")
             if not (isinstance(cid, str) and _CONTAINER_ID_RE.match(cid) and cid in ids):
                 continue
-            if not (o.get("State") or {}).get("Running"):
+            state = o.get("State")
+            if not (isinstance(state, dict) and state.get("Running") is True):
                 continue
             name = str(o.get("Name") or "").lstrip("/")
             if not _CONTAINER_NAME_RE.match(name):
                 name = cid[:12]
             ports = []
-            for key, binds in ((o.get("NetworkSettings") or {}).get("Ports") or {}).items():
+            net = o.get("NetworkSettings")
+            published = net.get("Ports") if isinstance(net, dict) else None
+            for key, binds in (published.items() if isinstance(published, dict) else ()):
                 m = _PORT_KEY_RE.match(str(key))
                 if not m or not isinstance(binds, list):
                     continue
                 cport = int(m.group(1))
                 for b in binds:
-                    hp = str((b or {}).get("HostPort") or "")
-                    if not (hp.isdigit() and len(hp) <= 5 and 0 < int(hp) < 65536 and 0 < cport < 65536):
+                    if not isinstance(b, dict):
                         continue
-                    hip = str((b or {}).get("HostIp") or "")
+                    hp = str(b.get("HostPort") or "")
+                    if not (re.fullmatch(r"[0-9]{1,5}", hp) and 0 < int(hp) < 65536 and 0 < cport < 65536):
+                        continue
+                    hip = str(b.get("HostIp") or "")
                     ports.append((_norm_host(hip) if hip else "", int(hp), cport))
             out.append({"id": cid, "name": name, "ports": ports})
         return out
@@ -593,21 +617,22 @@ def _detect_container(cfg, host, port, inventory):
     inner = {cp for hip, hp, cp in c["ports"] if hp == port and _reachable(hip, host)}
     if len(inner) != 1:
         raise DetectError(400, "container %s maps port %d ambiguously" % (c["name"], port))
+    # {host}: where the router reached the vault — unless that is loopback, which means
+    # nothing to the reader's browser: then the host the reader already uses for /go.
+    gui_host = host
+    if host in ("127.0.0.1", "::1", "localhost"):
+        gui_host = _norm_host(urllib.parse.urlsplit(cfg["self_url"]).hostname or host)
     gui = None
     for gp in d["gui_container_ports"]:
-        published = {hp for hip, hp, cp in c["ports"] if cp == gp and _reachable(hip, host)}
+        published = {hp for hip, hp, cp in c["ports"] if cp == gp and _reachable(hip, gui_host)}
         if len(published) > 1:
             raise DetectError(400, "container %s publishes its GUI port %d several times" % (c["name"], gp))
         if published:
             gui = published.pop()
             break
     if gui is None:
-        raise DetectError(400, "container %s publishes no GUI port (detect.gui_container_ports)" % c["name"])
-    # {host}: where the router reached the vault — unless that is loopback, which means
-    # nothing to the reader's browser: then the host the reader already uses for /go.
-    gui_host = host
-    if host in ("127.0.0.1", "::1", "localhost"):
-        gui_host = urllib.parse.urlsplit(cfg["self_url"]).hostname or host
+        raise DetectError(400, "container %s publishes no GUI port reachable on %s "
+                               "(detect.gui_container_ports)" % (c["name"], gui_host))
     shown = "[%s]" % gui_host if ":" in gui_host else gui_host
     return {
         "open_mode": "docker-exec",
@@ -628,9 +653,11 @@ def detect_vault(cfg, hints, inventory):
         raise DetectError(400, "unknown vault (detection disabled)")
     if not hints.get("rest"):
         raise DetectError(400, "unknown vault: not configured, and the router sent no rest hint")
-    _, host, port = parse_rest_hint(hints["rest"])
+    _, host, port, scheme = parse_rest_hint(hints["rest"])
     if host in d["_local"]:
-        return _detect_container(cfg, host, port, inventory)
+        found = _detect_container(cfg, host, port, inventory)
+        found["open_scheme"] = scheme
+        return found
     if _host_in(host, d["_desktop"]):
         if not hints.get("obsidian_name"):
             raise DetectError(400, "desktop vault on %s: the router sent no obsidian_name hint" % host)
@@ -663,7 +690,10 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
         if not _printable(vault, 200):
             raise DetectError(400, "invalid vault name")
         # Detection needs both locks: only the router mints, and every link is signed.
-        if read_secret_file(cfg, "token_file")[0] != "on" or link_secret(cfg)[0] != "on":
+        locks = (read_secret_file(cfg, "token_file")[0], link_secret(cfg)[0])
+        if "error" in locks:
+            raise DetectError(503, "token or link-signing secret unreadable on the agent")
+        if locks != ("on", "on"):
             raise DetectError(400, "vault detection requires token_file and a link-signing secret")
         hints = normalize_hints(raw)
         return detect_vault(cfg, hints, inventory), hints
@@ -691,6 +721,14 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
             pass
 
         def do_GET(self):
+            try:
+                return self._get()
+            except Exception as e:  # never a dropped connection: the router reads that as transport
+                print("view-agent-direct: unexpected %s on %s" % (type(e).__name__, self.path.split("?")[0]),
+                      file=sys.stderr)
+                return self._send(500, {"error": "internal error"})
+
+        def _get(self):
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
 

@@ -424,6 +424,75 @@ class TestDetectContainer(DetectBase):
         _, path = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://127.0.0.1:27180"))
         self.assertEqual(self.get(path)[1]["Location"], "https://agent.test:3001/")
 
+    def test_malformed_rest_hint_is_a_400_not_a_dropped_connection(self):
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://[::1:80"))
+        self.assertEqual(code, 400)
+        self.assertIn("rest hint", json.loads(body)["error"])
+
+    def test_https_hint_navigates_over_https_on_loopback(self):
+        _, path = self.mint("vault=bob&note=a.md&rest=" + urllib.parse.quote("https://192.0.2.1:27181"))
+        self.get(path)
+        self.assertEqual(self.nav_cfgs[-1]["open_scheme"], "https")
+        _, path = self.mint("vault=v&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.get(path)
+        self.assertEqual(self.nav_cfgs[-1]["open_scheme"], "http")
+
+    def test_gui_bound_to_loopback_is_not_offered_to_the_reader(self):
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("127.0.0.1", 27180)],
+                                                          "3001/tcp": [("127.0.0.1", 3001)]})]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://127.0.0.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("GUI", json.loads(body)["error"])
+
+    def test_malformed_docker_inspect_shapes_never_crash(self):
+        weird = [{"Id": ID_A, "State": "running", "NetworkSettings": {"Ports": {}}},
+                 {"Id": ID_B, "State": {"Running": True}, "NetworkSettings": {"Ports": [1, 2]}}]
+        for objs in (weird, [dict(container(ID_A, "o", {"27180/tcp": [("0.0.0.0", 27180)]}),
+                                  NetworkSettings={"Ports": {"27180/tcp": ["x", {"HostPort": "\u00b2"}]}})],
+                     [{"Id": ID_A, "State": {"Running": True}, "NetworkSettings": 5}], "nope"):
+            self.docker.ps_stdout = ID_A + "\n" + ID_B + "\n"
+            self.docker.inspect_stdout = json.dumps(objs)
+            code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+            self.assertIn(code, (400, 503), repr(objs))
+
+    def test_one_malformed_bind_does_not_hide_the_container(self):
+        c = container(ID_A, "obs", {"27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]})
+        c["NetworkSettings"]["Ports"]["27180/tcp"].insert(0, "x")
+        c["NetworkSettings"]["Ports"]["9/tcp"] = [{"HostPort": "\u00b2"}]
+        self.docker.containers = [c]
+        data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(data["source"], "container obs")
+
+    def test_ipv4_mapped_local_address_is_local(self):
+        data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://[::ffff:192.0.2.1]:27180"))
+        self.assertEqual(data["source"], "container obsidian-notes")
+
+    def test_docker_down_is_remembered_briefly(self):
+        self.cfg["detect"]["cache_s"] = 60
+        self.docker.raises = FileNotFoundError("docker")
+        for _ in range(3):
+            self.assertEqual(self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))[0], 503)
+        self.assertEqual(len(self.docker.cmds), 1)
+
+    def test_unreadable_secret_is_503_on_the_detection_path(self):
+        os.mkdir(os.path.join(self.dir, "absent.secret"))          # a directory: unreadable
+        code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 503)
+
+    def test_unexpected_exception_is_a_json_500(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+        def boom(*a, **k):
+            raise KeyError("x")
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), va.make_handler(self.cfg, boom, self.docker))
+        self.base = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        _, path = self.mint("vault=alice&note=a.md")
+        code, _, body = self.get(path)
+        self.assertEqual(code, 500)
+        self.assertEqual(json.loads(body), {"error": "internal error"})
+
     def test_docker_inventory_is_cached(self):
         self.cfg["detect"]["cache_s"] = 60
         for _ in range(3):
@@ -510,12 +579,15 @@ class TestDetectPure(unittest.TestCase):
                     "http://192.0.2.1", "http://192.0.2.1:27180/x", "http://192.0.2.1:27180?a=1",
                     "http://192.0.2.1:27180#f", "http://192.0.2.1:99999", "http://bad_host:1",
                     "http://192.0.2.1:27180\\@x", "http://a b:1", "http://x:1\n", "", "192.0.2.1:27180",
-                    "http://$(id):1", "http://-x:1"):
+                    "http://$(id):1", "http://-x:1", "http://[::1:80", "http://[::1]x:80",
+                    "http://[fe80::1%25eth0]:27124"):
             with self.assertRaises(va.DetectError, msg=bad):
                 va.parse_rest_hint(bad)
 
     def test_rest_hint_normalization(self):
-        self.assertEqual(va.parse_rest_hint("HTTP://LocalHost:27180/"), ("http://localhost:27180", "localhost", 27180))
+        self.assertEqual(va.parse_rest_hint("HTTP://LocalHost:27180/"),
+                         ("http://localhost:27180", "localhost", 27180, "http"))
+        self.assertEqual(va.parse_rest_hint("http://[::ffff:192.0.2.1]:1")[1], "192.0.2.1")  # one spelling
         self.assertEqual(va.parse_rest_hint("https://[::1]:27124")[0], "https://[::1]:27124")
 
     def test_desktop_hosts_accept_cidr_and_names(self):
@@ -563,6 +635,19 @@ class TestDetectPure(unittest.TestCase):
         self.assertEqual(seen["cmd"], ["docker", "exec", ID_A, "curl", "-sS", "-o", "/dev/null", "-w",
                                        "%{http_code}", "--max-time", "4",
                                        "http://127.0.0.1:27180/open/wiki%2Fa%20b.md"])
+
+    def test_navigate_https_adds_k_only_for_https(self):
+        seen = []
+
+        class R:
+            returncode, stdout, stderr = 0, "200", ""
+        base = {"open_mode": "docker-exec", "container": ID_A, "open_port": 27124}
+        va.navigate(dict(base, open_scheme="https"), "a.md", "", lambda c: seen.append(c) or R())
+        va.navigate(base, "a.md", "", lambda c: seen.append(c) or R())
+        self.assertIn("-k", seen[0])
+        self.assertEqual(seen[0][-1], "https://127.0.0.1:27124/open/a.md")
+        self.assertNotIn("-k", seen[1])
+        self.assertEqual(seen[1][-1], "http://127.0.0.1:27124/open/a.md")
 
     def test_canonical_v2_is_unambiguous_and_separate_from_legacy(self):
         h = {"rest": "http://192.0.2.1:27180"}
