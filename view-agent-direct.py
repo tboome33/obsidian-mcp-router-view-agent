@@ -494,6 +494,14 @@ class DetectError(Exception):
         self.msg = msg
 
 
+class BudgetExhausted(DetectError):
+    """This request ran out of its own detection deadline. Says nothing about Docker's health:
+    never cached, never shared with other requests."""
+
+    def __init__(self, msg):
+        DetectError.__init__(self, 503, msg)
+
+
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _PORT_KEY_RE = re.compile(r"^([0-9]{1,5})/tcp$")
@@ -629,7 +637,7 @@ class DockerInventory:
         if deadline is None:
             deadline = time.monotonic() + DETECT_BUDGET_S
         if not self.lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-            raise DetectError(503, "docker inventory busy: time budget exhausted")
+            raise BudgetExhausted("docker inventory busy: time budget exhausted")
         try:
             now = time.monotonic()
             if not fresh and self.data is not None and now - self.at < self.d["cache_s"]:
@@ -638,6 +646,8 @@ class DockerInventory:
                 raise self.error  # Docker down: answer at once rather than queue on the lock
             try:
                 self.data, self.error = self._probe(deadline), None
+            except BudgetExhausted:
+                raise  # this request's deadline, not Docker's state: the cache stays as it was
             except DetectError as e:
                 self.data, self.error = None, e
             except Exception as e:  # malformed output of an unexpected shape: fail closed
@@ -653,9 +663,14 @@ class DockerInventory:
     def _call(self, args, deadline):
         left = deadline - time.monotonic()
         if left < 0.1:
-            raise DetectError(503, "docker: time budget exhausted")
+            raise BudgetExhausted("docker: time budget exhausted")
+        timeout = min(DOCKER_CALL_S, left)
         try:
-            r = self.runner([self.d["docker_path"]] + args, min(DOCKER_CALL_S, left))
+            r = self.runner([self.d["docker_path"]] + args, timeout)
+        except subprocess.TimeoutExpired:
+            if timeout < DOCKER_CALL_S:  # cut short by this request's deadline
+                raise BudgetExhausted("docker: time budget exhausted")
+            raise DetectError(503, "docker unavailable: no answer within %.1f s" % timeout)
         except Exception as e:
             raise DetectError(503, "docker unavailable: %s" % str(e)[:120])
         return r

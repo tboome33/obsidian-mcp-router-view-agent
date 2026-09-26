@@ -721,6 +721,35 @@ class TestDetectContainer(DetectBase):
         finally:
             releaser.join()
 
+    def test_a_request_out_of_budget_does_not_poison_the_cache(self):
+        detect = dict(self.cfg["detect"], cache_s=10)
+        inv = va.DockerInventory(detect, self.docker)
+        inv.lock.acquire()                        # another request holds the lock…
+        releaser = threading.Timer(0.3, inv.lock.release)
+        releaser.start()
+        try:
+            with self.assertRaises(va.DetectError):
+                inv.containers(deadline=time.monotonic() + 0.35)   # …acquired too late
+        finally:
+            releaser.join()
+        self.assertEqual(self.docker.cmds, [])
+        self.assertTrue(inv.containers())         # a full-budget request still asks Docker
+        self.assertEqual(len(self.docker.cmds), 2)
+
+    def test_a_docker_call_cut_short_by_the_deadline_is_not_cached(self):
+        detect = dict(self.cfg["detect"], cache_s=10)
+        state = {"slow": True}
+
+        def runner(cmd, timeout=None):
+            if state["slow"] and timeout < va.DOCKER_CALL_S:
+                raise va.subprocess.TimeoutExpired(cmd, timeout)
+            return self.docker(cmd, timeout)
+        inv = va.DockerInventory(detect, runner)
+        with self.assertRaises(va.DetectError):
+            inv.containers(deadline=time.monotonic() + 1.0)
+        state["slow"] = False
+        self.assertTrue(inv.containers())
+
     def test_detected_vault_without_note_gets_a_signed_checked_link(self):
         data, path = self.mint("vault=notes&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
         self.assertEqual(data["kind"], "direct-go")                 # never the raw GUI URL
