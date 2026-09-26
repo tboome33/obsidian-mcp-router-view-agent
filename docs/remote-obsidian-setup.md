@@ -147,7 +147,9 @@ the heading anchor is not carried.
 | `400 unknown vault` from `/view` | Not declared, and detection could not classify it (no hint, host neither local nor desktop). The error says why. |
 | `409` on click | What Docker shows behind the link changed since it was made: another container on that port, other folders mounted (or the same ones swapped) under the same container name, or the vault is now declared in the config. The link refuses to open anything else; ask for a fresh link. The check covers what is mounted where, not the vault's content. |
 | `502` page "could not be navigated (bridge HTTP 403)" | The bridge refused the call: it came from outside the container's loopback. Check `open_mode`, `container`, `open_port` (the REST port **inside** the container). |
-| `502` page "bridge HTTP 404" or a connection error, with a link to the GUI | Bridge plugin missing or disabled in that Obsidian, or Local REST API's HTTP server off. The page links to the GUI; the note is not opened. |
+| `502` page "bridge HTTP 404", with a link to the GUI | The bridge works but the note is not found in the vault Obsidian has open (moved, renamed, or another vault open). |
+| `502` page "bridge HTTP 401" | The `/open` route is not registered: bridge plugin missing or disabled, bridge < 0.2.0 or Local REST API < 4.0.0 — or Obsidian needs a reload. |
+| `502` page with a connection error | Local REST API's HTTP server is off, or `open_port` is wrong. The page links to the GUI; the note is not opened. |
 | The click hangs | Your PC cannot reach the agent: private network down, `bind`/`self_url` on loopback, firewall. |
 | `obsidian://` does nothing | Clicked from a machine without that desktop Obsidian, or the vault name in Obsidian differs from `obsidian_vault`. |
 
@@ -253,6 +255,8 @@ titre n'est pas transmise.
 | `400 unknown vault` sur `/view` | Vault non déclaré, et la détection n'a pas pu le classer (pas d'indice, hôte ni local ni de bureau). Le message dit pourquoi. |
 | `409` au clic | Ce que Docker montre derrière le lien a changé depuis sa création : un autre conteneur sur ce port, d'autres dossiers montés (ou les mêmes permutés) sous le même nom de conteneur, ou le vault est désormais déclaré dans la config. Le lien refuse d'ouvrir autre chose ; demander un nouveau lien. Le contrôle porte sur ce qui est monté où, pas sur le contenu du vault. |
 | Page `502` « could not be navigated (bridge HTTP 403) » | Le bridge a refusé l'appel : il ne venait pas de la boucle locale du conteneur. Vérifier `open_mode`, `container`, `open_port` (le port REST **dans** le conteneur). |
-| Page `502` « bridge HTTP 404 » ou erreur de connexion, avec un lien vers la GUI | Plugin bridge absent ou désactivé dans cet Obsidian, ou serveur HTTP de Local REST API coupé. La page renvoie vers la GUI ; la note n'est pas ouverte. |
+| Page `502` « bridge HTTP 404 », avec un lien vers la GUI | Le bridge fonctionne, mais la note est introuvable dans le vault ouvert par Obsidian (déplacée, renommée, ou autre vault ouvert). |
+| Page `502` « bridge HTTP 401 » | La route `/open` n'est pas enregistrée : plugin bridge absent ou désactivé, bridge < 0.2.0 ou Local REST API < 4.0.0 — ou Obsidian à recharger. |
+| Page `502` avec une erreur de connexion | Serveur HTTP de Local REST API coupé, ou `open_port` faux. La page renvoie vers la GUI ; la note n'est pas ouverte. |
 | Le clic ne répond pas | Le PC ne joint pas l'agent : réseau privé coupé, `bind`/`self_url` en boucle locale, pare-feu. |
 | `obsidian://` ne fait rien | Clic depuis une machine sans cet Obsidian de bureau, ou nom du vault dans Obsidian différent d'`obsidian_vault`. |

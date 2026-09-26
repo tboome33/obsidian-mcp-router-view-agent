@@ -501,6 +501,18 @@ def _mounts_identity(o):
     is mounted, or the same folders are swapped between destinations. It proves what Docker
     mounts where, not the vault's content. None when the container mounts nothing."""
     mounts = o.get("Mounts")
+    # A volume's subpath is only in the mount SPECS (HostConfig.Mounts, Compose long syntax),
+    # keyed here by (type, source, destination) to join it back onto the resolved mounts.
+    subpaths = {}
+    host_cfg = o.get("HostConfig")
+    specs = host_cfg.get("Mounts") if isinstance(host_cfg, dict) else None
+    for spec in (specs if isinstance(specs, list) else ()):
+        if not isinstance(spec, dict):
+            continue
+        vopts = spec.get("VolumeOptions")
+        sub = vopts.get("Subpath") if isinstance(vopts, dict) else None
+        if isinstance(sub, str) and sub:
+            subpaths[(spec.get("Type"), spec.get("Source"), spec.get("Target"))] = sub
     srcs = set()
     for m in (mounts if isinstance(mounts, list) else ()):
         if not isinstance(m, dict):
@@ -508,8 +520,7 @@ def _mounts_identity(o):
         kind = m.get("Type")
         src = m.get("Name") if kind == "volume" else m.get("Source") if kind == "bind" else None
         dest = m.get("Destination")
-        vopts = m.get("VolumeOptions") if isinstance(m.get("VolumeOptions"), dict) else {}
-        sub = vopts.get("Subpath") or ""
+        sub = subpaths.get((kind, src, dest), "")
         if (isinstance(src, str) and src and _printable(src, 4096)
                 and isinstance(dest, str) and dest and _printable(dest, 4096)
                 and isinstance(sub, str) and (not sub or _printable(sub, 4096))):

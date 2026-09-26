@@ -564,6 +564,25 @@ class TestDetectContainer(DetectBase):
             "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}, mounts=[v])]
         self.assertEqual(self._takeover([dict(v, Name="eve-data")])[0], 409)
 
+    def test_another_volume_subpath_is_another_vault(self):
+        # Real `docker inspect` shape: the resolved mount has no subpath, the spec in
+        # HostConfig.Mounts carries it (Compose long syntax `volume: {subpath: ...}`).
+        def vault_on(sub):
+            c = container(ID_A, "obsidian-notes", {"27180/tcp": [("0.0.0.0", 27180)],
+                                                   "3001/tcp": [("0.0.0.0", 3001)]},
+                          mounts=[{"Type": "volume", "Name": "vaults", "Destination": "/vault"}])
+            c["HostConfig"] = {"Mounts": [{"Type": "volume", "Source": "vaults", "Target": "/vault",
+                                           "VolumeOptions": {"Subpath": sub}}]}
+            return c
+        self.docker.containers = [vault_on("alice")]
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.docker.containers = [vault_on("bob")]
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 409)
+        self.assertNotIn("Location", headers)
+        self.docker.containers = [vault_on("alice")]                   # back: same identity
+        self.assertEqual(self.get(path)[0], 302)
+
     def test_identity_fields_sent_to_view_are_ignored(self):
         data, _ = self.mint("vault=notes&note=a.md&container=evil&vault_id=" + "0" * 16
                             + "&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
