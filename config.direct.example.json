@@ -33,6 +33,12 @@
       "_open_port": "Local REST API insecurePort INSIDE the container (the preflight confirms it).",
 
       "_alt_http": "If the container runs with network_mode host, use open_mode http + open_url http://127.0.0.1:27180 instead (the bridge then sees 127.0.0.1)."
+    },
+
+    "bob-desktop": {
+      "open_mode": "obsidian-uri",
+      "obsidian_vault": "Bob's notes",
+      "_obsidian_vault": "A vault served by the READER'S OWN desktop Obsidian (no web GUI): /go redirects to obsidian://open?vault=...&file=.... No public_url. Works only from the machine running that Obsidian."
     }
   }
 }

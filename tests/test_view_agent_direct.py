@@ -158,6 +158,50 @@ class TestTtl(AgentTestBase):
         self.assertIn("e", q)
 
 
+class TestObsidianUri(AgentTestBase):
+    """A vault opened in the reader's own desktop Obsidian: no GUI, no navigation here."""
+    EXTRA = {"vaults": {
+        "alice": {"public_url": "https://gui.test:3001/", "open_mode": "none"},
+        "desk": {"open_mode": "obsidian-uri", "obsidian_vault": "Mon vault & co"},
+    }}
+
+    def test_go_redirects_to_the_desktop_obsidian(self):
+        _, path = self.mint("vault=desk&note=" + urllib.parse.quote("wiki/a b#c.md") + "&h=Intro")
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 302)
+        self.assertEqual(headers["Location"],
+                         "obsidian://open?vault=Mon%20vault%20%26%20co&file=wiki%2Fa%20b%23c.md")
+        self.assertEqual(self.calls, [])  # nothing driven from this host
+
+    def test_go_still_requires_the_signature(self):
+        code, _, _ = self.get("/go?v=desk&n=wiki/a.md&s=deadbeef")
+        self.assertEqual(code, 403)
+
+    def test_go_refuses_a_traversal_even_when_signed(self):
+        # /view refuses it before minting; sign it by hand to reach /go.
+        link = va.build_go_link(self.cfg, "desk", "../secret.md")
+        code, _, _ = self.get(link.split("agent.test:27200", 1)[-1])
+        self.assertEqual(code, 400)
+
+    def test_view_without_note_opens_the_vault(self):
+        data, _ = self.mint("vault=desk")
+        self.assertEqual(data["url"], "obsidian://open?vault=Mon%20vault%20%26%20co")
+
+    def test_config_requires_obsidian_vault_but_not_public_url(self):
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "config.json")
+            with open(p, "w") as f:
+                json.dump({"vaults": {"desk": {"open_mode": "obsidian-uri"}}}, f)
+            with self.assertRaises(ValueError):
+                va.load_config(p)
+            with open(p, "w") as f:
+                json.dump({"vaults": {"desk": {"open_mode": "obsidian-uri", "obsidian_vault": "V"}}}, f)
+            self.assertIn("desk", va.load_config(p)["vaults"])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class TestPure(unittest.TestCase):
     def test_refused_paths(self):
         self.assertIsNone(va._safe_note("../x.md"))

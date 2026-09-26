@@ -92,6 +92,8 @@ Secrets referenced as `*_file` are re-read on every use — rotate them without 
 
 `view-agent-direct.py` serves the case where the vault's Obsidian GUI (e.g. a Selkies container) is **already** reachable by the reader over a private network. Instead of opening a tunnel, `/view` returns a signed link to the agent itself; on click, `/go` verifies the signature, navigates Obsidian onto the note and redirects to the GUI. Rationale and contract details: [docs/CONTRACT.md → Providers without a tunnel](docs/CONTRACT.md#providers-without-a-tunnel).
 
+**Desktop vaults** (`open_mode: "obsidian-uri"`): a vault served by the reader's own desktop Obsidian has no web GUI and cannot be driven from the agent's host (the bridge's `/open` is loopback-only on that machine). `/go` then verifies the signature and path and answers `302 obsidian://open?vault=<obsidian_vault>&file=<note>`: the reader's Obsidian opens the note itself. Only useful from the machine where that Obsidian runs; the heading anchor is not carried (`obsidian://open` has no heading parameter).
+
 Why `docker exec`: the bridge's `/open` route answers loopback callers only. From the host, a Docker-published port presents the Docker bridge IP, so the call gets `403`. The agent therefore runs `curl http://127.0.0.1:<port>/open/...` **inside** the container. With a host-network container, `open_mode: "http"` calls it directly.
 
 ```bash
@@ -123,7 +125,8 @@ Configuration keys beyond the reference's `bind` / `port` / `token_file`:
 | `link_ttl_s` | `0` | `0` = stable links. `> 0` = `/go` answers `410` after that many seconds, and `/view` reports it as `idle_timeout_s`. |
 | `navigate_on_view` | `false` | `true` also navigates on `/view`, which makes Obsidian jump on every note the router writes. |
 | `vaults.<name>.public_url` | — | The GUI as the reader sees it; redirect target. |
-| `vaults.<name>.open_mode` | `docker-exec` | `docker-exec` (`container`, `open_port`) · `http` (`open_url`) · `none`. |
+| `vaults.<name>.open_mode` | `docker-exec` | `docker-exec` (`container`, `open_port`) · `http` (`open_url`) · `none` · `obsidian-uri` (`obsidian_vault`; no `public_url`). |
+| `vaults.<name>.obsidian_vault` | — | `obsidian-uri` only: the vault's name as the reader's desktop Obsidian knows it. |
 
 What the link contains: vault name, note path, optional anchor and expiry, and a signature. No credentials. Following it only navigates and redirects to a GUI that is already private and keeps its own auth.
 
@@ -167,6 +170,8 @@ tests/                     unittest suites (no cloudflared, no Docker required)
 **Sécurité (défense en profondeur)** — ① l'agent n'écoute que sur un réseau **privé** (loopback ou IP VPN/WireGuard, pare-feu sur le port) ; ② **token partagé** optionnel (`view-agent.token` ↔ `OBSIDIAN_ROUTER_VIEW_AGENT_TOKEN`, en-tête `X-View-Token`) pour que seul le router puisse fabriquer des liens ; ③ tunnels **éphémères** à hostname imprévisible ; ④ l'auth basique du GUI reste le dernier verrou. Un lien fabriqué se traite comme un cookie de session.
 
 **Second provider, sans tunnel** — `view-agent-direct.py` sert le cas où le lecteur joint **déjà** le GUI par un réseau privé (WireGuard). `/view` rend un lien **signé HMAC** vers l'agent lui-même (`/go?…`), stable dans l'historique du chat ; au clic, l'agent vérifie la signature, navigue Obsidian sur la note (appel `/open` depuis le loopback du conteneur, par `docker exec`) puis redirige vers le GUI. Aucun identifiant dans le lien. Config : `config.direct.example.json` ; contrôles préalables : `deploy/preflight-direct.sh`.
+
+**Vaults de bureau** (`open_mode: "obsidian-uri"`) : un vault servi par l'Obsidian de bureau du lecteur n'a pas de GUI web et ne peut pas être piloté depuis l'hôte de l'agent. `/go` vérifie alors signature et chemin, puis répond `302 obsidian://open?vault=<obsidian_vault>&file=<note>` : c'est l'Obsidian du lecteur qui ouvre la note. Utile seulement depuis la machine où tourne cet Obsidian ; l'ancre de titre n'est pas transmise.
 
 **Démarrage** — `cp config.example.json config.json` (tout y est commenté), `openssl rand -hex 24 > view-agent.token`, `python3 view-agent.py config.json`, puis côté router : `OBSIDIAN_ROUTER_VIEW_AGENT_URL` + `OBSIDIAN_ROUTER_VIEW_AGENT_TOKEN`. Déploiement durable via systemd ou cron (`deploy/`). Tests : `python3 -m unittest discover -s tests` (sans cloudflared). **Python 3.8+ stdlib uniquement.**
 

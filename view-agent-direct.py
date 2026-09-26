@@ -22,6 +22,9 @@ What it does
          route FROM THE CONTAINER'S LOOPBACK (`docker exec <container> curl ...`), so the
          bridge's loopback guard is satisfied without being relaxed,
       3. answers 302 to the vault's `public_url` (the GUI).
+      For a vault opened in the READER'S OWN desktop Obsidian (`open_mode: obsidian-uri`),
+      steps 2-3 become a single 302 to `obsidian://open?vault=…&file=…`: nothing is driven
+      from this host, the reader's Obsidian opens the note itself.
       A failed navigation yields an explicit 502 HTML page with a link to the GUI — never
       a silent redirect.
 
@@ -80,9 +83,10 @@ DEFAULT_CONFIG = {
     "vaults": {},
 }
 
-VAULT_REQUIRED = ("public_url",)
+VAULT_REQUIRED = ("public_url",)       # except open_mode obsidian-uri (see load_config)
 VAULT_OPTIONAL = (
-    "open_mode",          # "docker-exec" (default) | "http" | "none"
+    "open_mode",          # "docker-exec" (default) | "http" | "none" | "obsidian-uri"
+    "obsidian_vault",     # obsidian-uri: the vault's name as the reader's Obsidian knows it
     "container",          # docker-exec: container name
     "open_port",          # docker-exec: Local REST API HTTP port (insecurePort) INSIDE the container
     "open_url",           # http: Local REST API base URL (the bridge must see the call as loopback)
@@ -111,15 +115,19 @@ def load_config(path):
     for name, v in cfg["vaults"].items():
         if not isinstance(v, dict):
             raise ValueError('vault "%s": must be an object' % name)
-        for k in VAULT_REQUIRED:
+        mode = v.get("open_mode", "docker-exec")
+        if mode not in ("docker-exec", "http", "none", "obsidian-uri"):
+            raise ValueError('vault "%s": open_mode must be docker-exec | http | none | obsidian-uri' % name)
+        # A desktop vault has no web GUI: it is opened by the reader's own Obsidian.
+        required = () if mode == "obsidian-uri" else VAULT_REQUIRED
+        for k in required:
             if not v.get(k):
                 raise ValueError('vault "%s": missing required key "%s"' % (name, k))
         unknown = [k for k in v if not k.startswith("_") and k not in VAULT_REQUIRED + VAULT_OPTIONAL]
         if unknown:
             raise ValueError('vault "%s": unknown key(s) %s' % (name, ", ".join(unknown)))
-        mode = v.get("open_mode", "docker-exec")
-        if mode not in ("docker-exec", "http", "none"):
-            raise ValueError('vault "%s": open_mode must be docker-exec | http | none' % name)
+        if mode == "obsidian-uri" and not (isinstance(v.get("obsidian_vault"), str) and v["obsidian_vault"].strip()):
+            raise ValueError('vault "%s": open_mode obsidian-uri requires "obsidian_vault"' % name)
         if mode == "docker-exec" and not (v.get("container") and v.get("open_port")):
             raise ValueError('vault "%s": open_mode docker-exec requires "container" and "open_port"' % name)
         if mode == "http" and not v.get("open_url"):
@@ -242,14 +250,24 @@ def open_path(note, anchor):
     return path
 
 
+def obsidian_uri(vault_cfg, note=""):
+    """`obsidian://open` URI for a vault opened in the reader's own desktop Obsidian.
+    `open` has no heading parameter: an anchor is not carried (documented limit)."""
+    uri = "obsidian://open?vault=" + urllib.parse.quote(vault_cfg["obsidian_vault"], safe="")
+    if note:
+        uri += "&file=" + urllib.parse.quote(note, safe="")
+    return uri
+
+
 def navigate(vault_cfg, note, anchor="", runner=None):
     """Navigate the vault's Obsidian onto the note. Returns (ok, detail). Never raises."""
     note = _safe_note(note)
     if not note:
         return (False, "path refused")
     mode = vault_cfg.get("open_mode", "docker-exec")
-    if mode == "none":
-        return (True, "navigation disabled")
+    if mode in ("none", "obsidian-uri"):
+        # obsidian-uri: nothing to drive from this host, the reader's Obsidian opens it.
+        return (True, "navigation disabled" if mode == "none" else "opened by the reader's Obsidian")
     try:
         if mode == "docker-exec":
             url = "http://127.0.0.1:%s%s" % (vault_cfg["open_port"], open_path(note, anchor))
@@ -327,7 +345,9 @@ def make_handler(cfg, navigate_fn=None):
                 if vault_cfg is None:
                     return self._send(400, {"error": "unknown vault", "vaults": sorted(cfg["vaults"].keys())})
                 if not note:
-                    # No note: a direct link to the GUI, nothing to navigate.
+                    # No note: a direct link to the GUI (or the desktop vault), nothing to navigate.
+                    if vault_cfg.get("open_mode") == "obsidian-uri":
+                        return self._send(200, {"url": obsidian_uri(vault_cfg), "vault": vault, "kind": "obsidian-uri"})
                     return self._send(200, {"url": vault_cfg["public_url"], "vault": vault, "kind": "direct"})
                 if _safe_note(note) is None:
                     return self._send(400, {"error": "bad note path"})
@@ -354,6 +374,17 @@ def make_handler(cfg, navigate_fn=None):
                 if not ok:
                     return self._send(code, {"error": msg})
                 vault_cfg = cfg["vaults"][vault]
+                if vault_cfg.get("open_mode") == "obsidian-uri":
+                    # Handed to the reader's desktop Obsidian. verify_go checks the signature,
+                    # not the path: refuse absolute paths and `..` here too (unsigned setups).
+                    if _safe_note(note) is None:
+                        return self._send(400, {"error": "bad note path"})
+                    self.send_response(302)
+                    self.send_header("Location", obsidian_uri(vault_cfg, note))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 nav_ok, detail = nav(vault_cfg, note, anchor)
                 target = vault_cfg["public_url"]
                 if nav_ok:
