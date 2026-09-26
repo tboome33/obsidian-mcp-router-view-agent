@@ -192,7 +192,7 @@ class TestObsidianUri(AgentTestBase):
             self.assertNotIn("Location", headers)
 
     def test_go_encodes_hostile_values_into_one_file_parameter(self):
-        note = "wiki/a&vault=other&file=x\r\nSet-Cookie: y#é.md"
+        note = "wiki/a&vault=other&file=x;Set-Cookie: y#é.md"
         link = va.build_go_link(self.cfg, "desk", note)
         code, headers, _ = self.get(link.split("agent.test:27200", 1)[-1])
         self.assertEqual(code, 302)
@@ -402,7 +402,7 @@ class TestDetectContainer(DetectBase):
         _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
         self.docker.containers = []
         code, headers, body = self.get(path)
-        self.assertEqual(code, 502)
+        self.assertEqual(code, 400)             # the classification error's own code, not 502
         self.assertNotIn("Location", headers)
         self.assertIn(b"27180", body)
         self.assertEqual(self.calls, [])
@@ -505,6 +505,70 @@ class TestDetectContainer(DetectBase):
         code, _, body = self.get(path)
         self.assertEqual(code, 500)
         self.assertEqual(json.loads(body), {"error": "internal error"})
+
+    # --- the vault's identity is signed: a port taken over by another vault is refused
+    def test_port_taken_over_by_another_container_is_refused_at_go(self):
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.docker.containers = [container("e" * 64, "obsidian-eve", {
+            "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]})]
+        code, headers, body = self.get(path)
+        self.assertEqual(code, 409)
+        self.assertNotIn("Location", headers)
+        self.assertIn(b"obsidian-eve", body)
+        self.assertEqual(self.calls, [])
+
+    def test_recreated_container_keeps_its_name_and_is_found_again(self):
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.docker.containers = [dict(VAULTS_HOST[0], Id="f" * 64)]   # same name, new ID
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 302)
+        self.assertEqual(self.nav_cfgs[-1]["container"], "f" * 64)
+
+    def test_container_identity_is_signed_and_never_taken_from_view(self):
+        data, path = self.mint("vault=notes&note=a.md&container=obsidian-bob&rest="
+                               + urllib.parse.quote("http://192.0.2.1:27180"))
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)
+        self.assertEqual(q["c"], ["obsidian-notes"])                  # from Docker, not the request
+        self.assertEqual(self.get(path.replace("c=obsidian-notes", "c=obsidian-bob"))[0], 403)
+
+    def test_hint_link_without_container_identity_is_refused(self):
+        link = va.build_go_link(self.cfg, "notes", "a.md", "", {"rest": "http://192.0.2.1:27180"})
+        code, _, _ = self.get(link.split("agent.test:27200", 1)[-1])
+        self.assertEqual(code, 409)
+        self.assertEqual(self.calls, [])
+
+    # --- a click sees Docker as it is now, whatever the cache
+    def test_go_bypasses_the_inventory_cache(self):
+        self.cfg["detect"]["cache_s"] = 60
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.docker.containers = [container("e" * 64, "obsidian-eve", {
+            "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]})]
+        self.assertEqual(self.get(path)[0], 409)       # cached inventory would still say notes
+        self.docker.containers = [dict(VAULTS_HOST[0], Id="f" * 64)]
+        self.assertEqual(self.get(path)[0], 302)
+        self.assertEqual(self.nav_cfgs[-1]["container"], "f" * 64)
+
+    def test_docker_down_at_click_is_503(self):
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.docker.raises = FileNotFoundError("docker")
+        self.assertEqual(self.get(path)[0], 503)
+
+    # --- address families
+    def test_ipv4_only_publication_does_not_answer_an_ipv6_hint(self):
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("0.0.0.0", 27180)],
+                                                          "3001/tcp": [("0.0.0.0", 3001), ("::", 3001)]})]
+        code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://[::1]:27180"))
+        self.assertEqual(code, 400)
+
+    def test_ipv6_only_publication_does_not_answer_an_ipv4_hint(self):
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("::", 27180)],
+                                                          "3001/tcp": [("0.0.0.0", 3001), ("::", 3001)]})]
+        code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+
+    def test_ipv6_hint_matches_an_ipv6_publication(self):
+        data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://[::1]:27180"))
+        self.assertEqual(data["source"], "container obsidian-notes")    # published on :: too
 
     def test_docker_inventory_is_cached(self):
         self.cfg["detect"]["cache_s"] = 60
@@ -672,6 +736,20 @@ class TestDetectPure(unittest.TestCase):
         self.assertEqual(seen[0][-1], "https://127.0.0.1:27124/open/a.md")
         self.assertNotIn("-k", seen[1])
         self.assertEqual(seen[1][-1], "http://127.0.0.1:27124/open/a.md")
+
+    def test_line_breaks_never_reach_a_signature(self):
+        with self.assertRaises(ValueError):
+            va.build_go_link({"link_ttl_s": 0, "self_url": "http://a", "_dir": "/nonexistent",
+                              "link_secret_file": "x", "token_file": "y"}, "v", "a\nb")
+        for q in ({"v": ["v"], "n": ["a\nb"], "s": ["x"]}, {"v": ["v\r"], "n": ["a"], "s": ["x"]},
+                  {"v": ["v"], "n": ["a"], "h": ["b\n"], "s": ["x"]}):
+            ok, code, *_ = va.verify_go({"link_ttl_s": 0, "_dir": "/nonexistent", "vaults": {},
+                                         "link_secret_file": "x", "token_file": "y"}, q)
+            self.assertEqual((ok, code), (False, 400))
+
+    def test_legacy_links_keep_their_signature(self):
+        # Links already in chat histories must stay valid: the legacy format is unchanged.
+        self.assertEqual(va._canonical("v", "wiki/a.md", "Intro", 0), "v\nwiki/a.md\nIntro\n0")
 
     def test_canonical_v2_is_unambiguous_and_separate_from_legacy(self):
         h = {"rest": "http://192.0.2.1:27180"}

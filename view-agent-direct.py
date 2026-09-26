@@ -319,9 +319,16 @@ def _canonical(vault, note, anchor, exp, hints=None):
         # raw newline), in a domain the legacy format below can never produce. Stripping
         # the hints from such a link therefore breaks its signature.
         return "v2\n" + json.dumps([vault, note, anchor or "", int(exp or 0),
-                                    hints.get("rest", ""), hints.get("obsidian_name", "")],
+                                    hints.get("rest", ""), hints.get("obsidian_name", ""),
+                                    hints.get("container", "")],
                                    ensure_ascii=True, separators=(",", ":"))
     return "\n".join([vault, note, anchor or "", str(exp or 0)])
+
+
+def _has_line_break(*fields):
+    """The legacy format joins fields with a newline, so a field that contains one could be
+    re-split into another (vault, note, anchor): links never carry CR or LF, in either format."""
+    return any("\n" in (f or "") or "\r" in (f or "") for f in fields)
 
 
 def sign(secret, vault, note, anchor, exp, hints=None):
@@ -333,6 +340,8 @@ def sign(secret, vault, note, anchor, exp, hints=None):
 def build_go_link(cfg, vault, note, anchor="", hints=None):
     """Compose the /go link. Signed when a secret exists; expiry from link_ttl_s.
     `hints` (rest / obsidian_name) are for detected vaults, which require a signature."""
+    if _has_line_break(vault, note, anchor):
+        raise ValueError("line break in a link field")
     exp = int(time.time()) + cfg["link_ttl_s"] if cfg["link_ttl_s"] else 0
     params = [("v", vault), ("n", note)]
     if anchor:
@@ -344,6 +353,8 @@ def build_go_link(cfg, vault, note, anchor="", hints=None):
             params.append(("r", hints["rest"]))
         if hints.get("obsidian_name"):
             params.append(("o", hints["obsidian_name"]))
+        if hints.get("container"):
+            params.append(("c", hints["container"]))
     mode, secret = link_secret(cfg)
     if mode == "error":
         raise RuntimeError("link-signing secret unreadable")
@@ -362,10 +373,12 @@ def verify_go(cfg, q):
     anchor = (q.get("h") or [""])[0]
     exp_s = (q.get("e") or ["0"])[0]
     sig = (q.get("s") or [""])[0]
-    hints = {k: (q.get(p) or [""])[0] for k, p in (("rest", "r"), ("obsidian_name", "o"))}
+    hints = {k: (q.get(p) or [""])[0] for k, p in (("rest", "r"), ("obsidian_name", "o"), ("container", "c"))}
     hints = {k: v for k, v in hints.items() if v} or None
     if not vault or not note:
         return (False, 400, "parameters v and n are required", vault, note, anchor, None)
+    if _has_line_break(vault, note, anchor):
+        return (False, 400, "line break in a link field", vault, note, anchor, None)
     try:
         exp = int(exp_s)
     except ValueError:
@@ -518,6 +531,11 @@ def normalize_hints(raw):
         if not _printable(name, 255) or name != name.strip():
             raise DetectError(400, "obsidian_name hint: invalid vault name")
         hints["obsidian_name"] = name
+    container = raw.get("container")
+    if container:
+        if not (isinstance(container, str) and _CONTAINER_NAME_RE.match(container)):
+            raise DetectError(400, "container hint: invalid container name")
+        hints["container"] = container
     return hints
 
 
@@ -537,12 +555,14 @@ class DockerInventory:
         self.data = None
         self.error = None
 
-    def containers(self):
+    def containers(self, fresh=False):
+        """`fresh`: bypass the cache — a click (/go) acts on the container, so it must see
+        Docker as it is now, not as it was up to `cache_s` seconds ago."""
         with self.lock:
             now = time.monotonic()
-            if self.data is not None and now - self.at < self.d["cache_s"]:
+            if not fresh and self.data is not None and now - self.at < self.d["cache_s"]:
                 return self.data
-            if self.error is not None and now - self.at < min(self.d["cache_s"], 5):
+            if not fresh and self.error is not None and now - self.at < min(self.d["cache_s"], 5):
                 raise self.error  # Docker down: answer at once rather than queue on the lock
             try:
                 self.data, self.error = self._probe(), None
@@ -613,15 +633,24 @@ class DockerInventory:
 
 
 def _reachable(bind_ip, host):
-    if bind_ip in _WILDCARD_IPS or bind_ip == host:
+    """Does a Docker publication on `bind_ip` answer on `host`? Docker publishes IPv4 and
+    IPv6 separately: 0.0.0.0 is every IPv4 address only, :: every IPv6 address only."""
+    if bind_ip == "" or bind_ip == host:
         return True
-    # Docker reports an IP; "localhost" is how a router on this host may spell loopback.
-    return host == "localhost" and bind_ip in ("127.0.0.1", "::1")
+    if host == "localhost":  # how a router on this host may spell loopback: either family
+        return bind_ip in ("127.0.0.1", "::1", "0.0.0.0", "::")
+    try:
+        family = ipaddress.ip_address(host).version
+    except ValueError:
+        # A host name may resolve to either family: accept both wildcards. A family split
+        # across two containers still ends as "several containers" (ambiguous → 400).
+        return bind_ip in ("0.0.0.0", "::")
+    return (bind_ip == "0.0.0.0" and family == 4) or (bind_ip == "::" and family == 6)
 
 
-def _detect_container(cfg, host, port, inventory):
+def _detect_container(cfg, host, port, inventory, fresh=False):
     d = cfg["detect"]
-    hits = [c for c in inventory.containers()
+    hits = [c for c in inventory.containers(fresh)
             if any(hp == port and _reachable(hip, host) for hip, hp, _ in c["ports"])]
     if not hits:
         raise DetectError(400, "no running container publishes port %d on this host" % port)
@@ -657,10 +686,11 @@ def _detect_container(cfg, host, port, inventory):
         "docker_path": d["docker_path"],
         "curl_path": d["curl_path"],
         "_detected": "container %s" % c["name"],
+        "_container_name": c["name"],     # the vault's identity, signed into the link
     }
 
 
-def detect_vault(cfg, hints, inventory):
+def detect_vault(cfg, hints, inventory, fresh=False):
     """Classify a vault absent from `vaults` from normalized hints → a vault config.
     Raises DetectError; never returns a guess."""
     d = cfg["detect"]
@@ -670,7 +700,7 @@ def detect_vault(cfg, hints, inventory):
         raise DetectError(400, "unknown vault: not configured, and the router sent no rest hint")
     _, host, port, scheme = parse_rest_hint(hints["rest"])
     if host in d["_local"]:
-        found = _detect_container(cfg, host, port, inventory)
+        found = _detect_container(cfg, host, port, inventory, fresh)
         found["open_scheme"] = scheme
         return found
     if _host_in(host, d["_desktop"]):
@@ -711,7 +741,11 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
         if locks != ("on", "on"):
             raise DetectError(400, "vault detection requires token_file and a link-signing secret")
         hints = normalize_hints(raw)
-        return detect_vault(cfg, hints, inventory), hints
+        hints.pop("container", None)  # identity comes from Docker, never from the request
+        found = detect_vault(cfg, hints, inventory)
+        if found.get("_container_name"):
+            hints["container"] = found["_container_name"]
+        return found, hints
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, obj):
@@ -780,7 +814,7 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                     if vault_cfg.get("open_mode") == "obsidian-uri":
                         return self._send(200, {"url": obsidian_uri(vault_cfg), "vault": vault, "kind": "obsidian-uri"})
                     return self._send(200, {"url": vault_cfg["public_url"], "vault": vault, "kind": "direct"})
-                if _safe_note(note) is None:
+                if _safe_note(note) is None or _has_line_break(vault, note, anchor):
                     return self._send(400, {"error": "bad note path"})
                 navigated = None
                 if cfg.get("navigate_on_view"):
@@ -811,9 +845,17 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                 else:
                     # Re-detect on click: the container may have been recreated since /view.
                     try:
-                        vault_cfg = detect_vault(cfg, normalize_hints(hints), inventory)
+                        vault_cfg = detect_vault(cfg, normalize_hints(hints), inventory, fresh=True)
+                        signed_as = hints.get("container")
+                        found_as = vault_cfg.get("_container_name")
+                        if signed_as != found_as:
+                            # Another container now answers on that port (or the link names none):
+                            # refuse rather than open a different vault with the same signed link.
+                            raise DetectError(409, "the vault moved: this link was made for %s, "
+                                                   "now %s" % (signed_as or "no container",
+                                                               found_as or "a desktop Obsidian"))
                     except DetectError as e:
-                        return self._html(502, "The vault “%s” could not be located (%s)." % (vault, e.msg))
+                        return self._html(e.code, "The vault “%s” could not be located (%s)." % (vault, e.msg))
                 if vault_cfg.get("open_mode") == "obsidian-uri":
                     # Handed to the reader's desktop Obsidian. verify_go checks the signature,
                     # not the path: refuse absolute paths and `..` here too (unsigned setups).
