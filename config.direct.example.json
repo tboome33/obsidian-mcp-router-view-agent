@@ -21,6 +21,20 @@
   "navigate_on_view": false,
   "_navigate_on_view": "true would make Obsidian jump to every note the router writes; false = navigate on click only.",
 
+  "detect": {
+    "_comment": "Vaults ABSENT from \"vaults\" are classified from the router's /view hints (rest=<scheme://host:port>, obsidian_name=<label>). A \"vaults\" entry always wins. Needs token_file AND a signing secret. Anything unclassifiable is a 400 with the reason, never a guessed link.",
+    "enabled": true,
+    "desktop_hosts": ["192.0.2.20"],
+    "_desktop_hosts": "IPs, CIDRs or names of machines whose vaults are opened in the reader's DESKTOP Obsidian → obsidian-uri (the router must send obsidian_name). Empty = never.",
+    "local_hosts": [],
+    "_local_hosts": "Extra names/IPs of THIS host as the router spells it. Loopback, bind and the self_url host are implied. A rest hint on this host → the ONE running container publishing that port → docker-exec.",
+    "gui_container_ports": [3001],
+    "_gui_container_ports": "Container-side GUI port(s) (linuxserver/obsidian: 3001 = HTTPS). The host port publishing it becomes the redirect target.",
+    "gui_url": "https://{host}:{port}/",
+    "_gui_url": "{host} = host of the rest hint (the self_url host when that is loopback), {port} = published GUI port. Must be http(s)://{host}:{port} plus an optional path: no fixed host, no proxy.",
+    "cache_s": 10
+  },
+
   "vaults": {
     "alice": {
       "public_url": "https://192.0.2.10:3001/",
@@ -30,6 +44,8 @@
       "container": "obsidian-alice",
       "_container": "Real container name: deploy/preflight-direct.sh prints it.",
       "open_port": 27180,
+      "open_scheme": "http",
+      "_open_scheme": "https when open_port is the Local REST API's TLS port (curl -k on the container's loopback).",
       "_open_port": "Local REST API insecurePort INSIDE the container (the preflight confirms it).",
 
       "_alt_http": "If the container runs with network_mode host, use open_mode http + open_url http://127.0.0.1:27180 instead (the bridge then sees 127.0.0.1)."
