@@ -378,7 +378,9 @@ def verify_go(cfg, q):
     hints = {k: (q.get(p) or [""])[0] for k, p in (("rest", "r"), ("obsidian_name", "o"), ("container", "c"),
                                                    ("vault_id", "k"))}
     hints = {k: v for k, v in hints.items() if v} or None
-    if not vault or not note:
+    if not vault or not (note or hints):
+        # A detection link (it carries hints) may have no note: it then only opens the GUI,
+        # after the same identity check. Links of configured vaults always carry one.
         return (False, 400, "parameters v and n are required", vault, note, anchor, None)
     if _has_line_break(vault, note, anchor):
         return (False, 400, "line break in a link field", vault, note, anchor, None)
@@ -594,7 +596,8 @@ def normalize_hints(raw):
 
 
 def _run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+    # Two calls at most per detection: 2 x 2.5 s stays under the router's 6 s eager budget.
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=2.5)
 
 
 class DockerInventory:
@@ -750,6 +753,14 @@ def _detect_container(cfg, host, port, inventory, fresh=False):
         if published:
             gui = published.pop()
             break
+    if gui is not None:
+        # The reader's browser will open {gui_host}:{gui}: no OTHER container may answer there,
+        # in either address family, or the redirect could land on another vault.
+        others = sorted(o["name"] for o in containers if o["id"] != c["id"]
+                        and any(hp == gui and _reachable(hip, gui_host) for hip, hp, _ in o["ports"]))
+        if others:
+            raise DetectError(400, "GUI port %d on %s is also published by %s: ambiguous"
+                                   % (gui, gui_host, ", ".join(others)))
     if gui is None:
         raise DetectError(400, "container %s publishes no GUI port reachable on %s "
                                "(detect.gui_container_ports)" % (c["name"], gui_host))
@@ -892,9 +903,21 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                     return self._send(e.code, {"error": e.msg, "vault": vault,
                                                "vaults": sorted(cfg["vaults"].keys())})
                 if not note:
-                    # No note: a direct link to the GUI (or the desktop vault), nothing to navigate.
+                    # No note: a link to the GUI (or the desktop vault), nothing to navigate.
                     if vault_cfg.get("open_mode") == "obsidian-uri":
                         return self._send(200, {"url": obsidian_uri(vault_cfg), "vault": vault, "kind": "obsidian-uri"})
+                    if hints is not None:
+                        # A DETECTED container vault: never hand out its GUI URL raw — the port
+                        # may be reassigned before the click. A signed /go link re-checks the
+                        # identity first, then redirects.
+                        if _has_line_break(vault, "", anchor):
+                            return self._send(400, {"error": "bad anchor"})
+                        try:
+                            link = build_go_link(cfg, vault, "", "", hints)
+                        except RuntimeError as e:
+                            return self._send(503, {"error": str(e)})
+                        return self._send(200, {"url": link, "vault": vault, "kind": "direct-go",
+                                                "source": vault_cfg.get("_detected", "config")})
                     return self._send(200, {"url": vault_cfg["public_url"], "vault": vault, "kind": "direct"})
                 if _safe_note(note) is None or _has_line_break(vault, note, anchor):
                     return self._send(400, {"error": "bad note path"})
@@ -922,26 +945,31 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                 ok, code, msg, vault, note, anchor, hints = verify_go(cfg, q)
                 if not ok:
                     return self._send(code, {"error": msg})
+                def locate():
+                    """Re-detect NOW (fresh inventory) and require the signed identity.
+                    Raises DetectError (409 when another vault answers there)."""
+                    found = detect_vault(cfg, normalize_hints(hints), inventory, fresh=True)
+                    signed_as = hints.get("container")
+                    found_as = found.get("_container_name")
+                    if (signed_as, hints.get("vault_id")) != (found_as, found.get("_vault_id")):
+                        # Another container now answers on that port (or the link names none):
+                        # refuse rather than open a different vault with the same signed link.
+                        raise DetectError(409, "the vault moved: this link was made for %s, "
+                                               "now %s" % (signed_as or "no container",
+                                                           found_as or "a desktop Obsidian"))
+                    return found
+
                 if hints is None:
                     vault_cfg = cfg["vaults"][vault]
                 else:
-                    # Re-detect on click: the container may have been recreated since /view.
                     try:
-                        vault_cfg = detect_vault(cfg, normalize_hints(hints), inventory, fresh=True)
-                        signed_as = hints.get("container")
-                        found_as = vault_cfg.get("_container_name")
-                        if (signed_as, hints.get("vault_id")) != (found_as, vault_cfg.get("_vault_id")):
-                            # Another container now answers on that port (or the link names none):
-                            # refuse rather than open a different vault with the same signed link.
-                            raise DetectError(409, "the vault moved: this link was made for %s, "
-                                                   "now %s" % (signed_as or "no container",
-                                                               found_as or "a desktop Obsidian"))
+                        vault_cfg = locate()
                     except DetectError as e:
                         return self._html(e.code, "The vault “%s” could not be located (%s)." % (vault, e.msg))
                 if vault_cfg.get("open_mode") == "obsidian-uri":
                     # Handed to the reader's desktop Obsidian. verify_go checks the signature,
                     # not the path: refuse absolute paths and `..` here too (unsigned setups).
-                    if _safe_note(note) is None:
+                    if note and _safe_note(note) is None:
                         return self._send(400, {"error": "bad note path"})
                     self.send_response(302)
                     self.send_header("Location", obsidian_uri(vault_cfg, note))
@@ -949,7 +977,19 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                nav_ok, detail = nav(vault_cfg, note, anchor)
+                if note:
+                    nav_ok, detail = nav(vault_cfg, note, anchor)
+                else:
+                    nav_ok, detail = True, "no note: GUI only"  # detection links only (verify_go)
+                if nav_ok and hints is not None:
+                    # Second check, right before the redirect: the container may have been
+                    # replaced while Obsidian was being navigated. This narrows the window to
+                    # the time between this check and the browser loading the GUI; it cannot
+                    # close it.
+                    try:
+                        vault_cfg = locate()
+                    except DetectError as e:
+                        return self._html(e.code, "The vault “%s” could not be located (%s)." % (vault, e.msg))
                 target = vault_cfg["public_url"]
                 if nav_ok:
                     self.send_response(302)

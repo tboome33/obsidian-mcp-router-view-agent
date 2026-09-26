@@ -132,9 +132,10 @@ returns a `viewLink`, and `get_view_link` gives one on demand.
   and holds the link can navigate that vault's Obsidian (the GUI still asks for its own login).
 - A token pasted in a chat is exposed: rotate it.
 - What a detected link guarantees: at click time, the agent re-checks that the same container name with the
-  same mounts (what Docker mounts where) answers on that port, and refuses (`409`) otherwise. It does not
-  prove the vault's content, and a container replaced between the `302` and the moment your browser loads
-  the GUI cannot be caught: keep the GUI's own login.
+  same mounts (what Docker mounts where) answers on that port — before navigating and again right before the
+  redirect — and refuses (`409`) otherwise. A detected vault's GUI address is only ever handed out through such
+  a checked link. It does not prove the vault's content, and a container replaced between that last check and
+  the moment your browser loads the GUI cannot be caught: keep the GUI's own login.
 
 ## 7. The desktop case, side by side
 
@@ -152,9 +153,9 @@ the heading anchor is not carried.
 | `400 … indeterminate` from `/view` | The router names the server by a host NAME while a container publishes the port on an explicit address: the agent cannot tell which one the name means. Put an IP in the vault's `baseUrl` on the router side. |
 | `409` on click | What Docker shows behind the link changed since it was made: another container on that port, other folders mounted (or the same ones swapped) under the same container name, or the vault is now declared in the config. The link refuses to open anything else; ask for a fresh link. The check covers what is mounted where, not the vault's content. |
 | `502` page "could not be navigated (bridge HTTP 403)" | The bridge refused the call: it came from outside the container's loopback. Check `open_mode`, `container`, `open_port` (the REST port **inside** the container). |
-| `502` page "bridge HTTP 404", with a link to the GUI | The bridge works but the note is not found in the vault Obsidian has open (moved, renamed, or another vault open). |
+| `502` page "bridge HTTP 404" | The bridge works but the note is not found in the vault Obsidian has open (moved, renamed, or another vault open). The page links to the GUI for a declared vault only. |
 | `502` page "bridge HTTP 401" | The `/open` route is not registered: bridge plugin missing or disabled, bridge < 0.2.0 or Local REST API < 4.0.0 — or Obsidian needs a reload. |
-| `502` page with a connection error | Local REST API's HTTP server is off, or `open_port` is wrong. The page links to the GUI; the note is not opened. |
+| `502` page with a connection error | Local REST API's HTTP server is off, or `open_port` is wrong. The note is not opened; the page links to the GUI for a declared vault only. |
 | The click hangs | Your PC cannot reach the agent: private network down, `bind`/`self_url` on loopback, firewall. |
 | `obsidian://` does nothing | Clicked from a machine without that desktop Obsidian, or the vault name in Obsidian differs from `obsidian_vault`. |
 
@@ -245,9 +246,10 @@ Dans l'environnement du serveur MCP (pour Claude Code : le bloc `env` de `~/.cla
   détient le lien peut faire naviguer l'Obsidian de ce vault (la GUI demande toujours son propre identifiant).
 - Un jeton collé dans une conversation est exposé : le changer.
 - Ce que garantit un lien détecté : au clic, l'agent revérifie que le même nom de conteneur, avec les mêmes
-  montages (ce que Docker monte où), répond sur ce port, et refuse (`409`) sinon. Cela ne prouve pas le
-  contenu du vault, et un conteneur remplacé entre le `302` et le chargement de la GUI par le navigateur ne
-  peut pas être intercepté : garder l'identifiant propre de la GUI.
+  montages (ce que Docker monte où), répond sur ce port — avant de naviguer, puis juste avant la redirection —
+  et refuse (`409`) sinon. L'adresse de la GUI d'un vault détecté n'est donnée que par un tel lien vérifié.
+  Cela ne prouve pas le contenu du vault, et un conteneur remplacé entre cette dernière vérification et le
+  chargement de la GUI par le navigateur ne peut pas être intercepté : garder l'identifiant propre de la GUI.
 
 ### 7. Le cas du bureau, en contrepoint
 
@@ -265,8 +267,8 @@ titre n'est pas transmise.
 | `400 … indeterminate` sur `/view` | Le router désigne le serveur par un NOM d'hôte alors qu'un conteneur publie le port sur une adresse précise : l'agent ne peut pas savoir laquelle le nom désigne. Mettre une IP dans le `baseUrl` du vault côté router. |
 | `409` au clic | Ce que Docker montre derrière le lien a changé depuis sa création : un autre conteneur sur ce port, d'autres dossiers montés (ou les mêmes permutés) sous le même nom de conteneur, ou le vault est désormais déclaré dans la config. Le lien refuse d'ouvrir autre chose ; demander un nouveau lien. Le contrôle porte sur ce qui est monté où, pas sur le contenu du vault. |
 | Page `502` « could not be navigated (bridge HTTP 403) » | Le bridge a refusé l'appel : il ne venait pas de la boucle locale du conteneur. Vérifier `open_mode`, `container`, `open_port` (le port REST **dans** le conteneur). |
-| Page `502` « bridge HTTP 404 », avec un lien vers la GUI | Le bridge fonctionne, mais la note est introuvable dans le vault ouvert par Obsidian (déplacée, renommée, ou autre vault ouvert). |
+| Page `502` « bridge HTTP 404 » | Le bridge fonctionne, mais la note est introuvable dans le vault ouvert par Obsidian (déplacée, renommée, ou autre vault ouvert). La page renvoie vers la GUI pour un vault déclaré seulement. |
 | Page `502` « bridge HTTP 401 » | La route `/open` n'est pas enregistrée : plugin bridge absent ou désactivé, bridge < 0.2.0 ou Local REST API < 4.0.0 — ou Obsidian à recharger. |
-| Page `502` avec une erreur de connexion | Serveur HTTP de Local REST API coupé, ou `open_port` faux. La page renvoie vers la GUI ; la note n'est pas ouverte. |
+| Page `502` avec une erreur de connexion | Serveur HTTP de Local REST API coupé, ou `open_port` faux. La note n'est pas ouverte ; la page renvoie vers la GUI pour un vault déclaré seulement. |
 | Le clic ne répond pas | Le PC ne joint pas l'agent : réseau privé coupé, `bind`/`self_url` en boucle locale, pare-feu. |
 | `obsidian://` ne fait rien | Clic depuis une machine sans cet Obsidian de bureau, ou nom du vault dans Obsidian différent d'`obsidian_vault`. |

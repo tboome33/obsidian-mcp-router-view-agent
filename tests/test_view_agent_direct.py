@@ -297,6 +297,8 @@ def _serve_with_docker(self):
     def fake_nav(vault_cfg, note, anchor=""):
         self.calls.append((note, anchor))
         self.nav_cfgs.append(vault_cfg)
+        if getattr(self, "on_nav", None):
+            self.on_nav()                       # e.g. Docker changes while Obsidian navigates
         return (not note.startswith("fail"), "test")
 
     self.nav_cfgs = []
@@ -648,6 +650,45 @@ class TestDetectContainer(DetectBase):
         code, _, body = self.get(path)
         self.assertEqual(code, 502)
         self.assertNotIn(b"href", body)
+
+    def test_gui_port_answered_by_another_container_is_ambiguous(self):
+        # REST of A on loopback; A's GUI on 0.0.0.0:3001, B's GUI on [::]:3001; the GUI host is
+        # the self_url NAME: the browser could reach either one.
+        self.docker.containers = [
+            container(ID_A, "a", {"27180/tcp": [("127.0.0.1", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}),
+            container(ID_B, "b", {"3001/tcp": [("::", 3001)]}),
+        ]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://127.0.0.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("also published by b", json.loads(body)["error"])
+
+    def test_detected_vault_without_note_gets_a_signed_checked_link(self):
+        data, path = self.mint("vault=notes&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(data["kind"], "direct-go")                 # never the raw GUI URL
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)
+        self.assertIn("k", q)
+        code, headers, _ = self.get(path)
+        self.assertEqual((code, headers.get("Location")), (302, "https://192.0.2.1:3001/"))
+        self.assertEqual(self.calls, [])                            # nothing to navigate
+        self.docker.containers = [container("e" * 64, "obsidian-eve", {
+            "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]})]
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 409)
+        self.assertNotIn("Location", headers)
+
+    def test_container_replaced_during_navigation_is_refused_before_the_redirect(self):
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+
+        def swap():
+            self.docker.containers = [container("e" * 64, "obsidian-eve", {
+                "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]})]
+        self.on_nav = swap
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 409)
+        self.assertNotIn("Location", headers)
+
+    def test_legacy_link_without_note_is_still_refused(self):
+        self.assertEqual(self.get("/go?v=alice&n=&s=x")[0], 400)
 
     def test_identity_fields_sent_to_view_are_ignored(self):
         data, _ = self.mint("vault=notes&note=a.md&container=evil&vault_id=" + "0" * 16
