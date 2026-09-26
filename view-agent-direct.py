@@ -55,6 +55,7 @@ import hashlib
 import hmac
 import html
 import json
+import ntpath
 import os
 import subprocess
 import sys
@@ -237,6 +238,10 @@ def _safe_note(note):
     """Refuse what the bridge would refuse anyway (absolute path, `..`) so we never compose
     a dubious command line."""
     if not note or note.startswith("/") or note.startswith("\\"):
+        return None
+    # A drive prefix (C:\x, C:/x, C:x) is an absolute path for a Windows reader's Obsidian,
+    # whatever the OS this agent runs on.
+    if ntpath.splitdrive(note)[0]:
         return None
     if any(seg == ".." for seg in note.replace("\\", "/").split("/")):
         return None

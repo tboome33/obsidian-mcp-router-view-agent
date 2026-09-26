@@ -183,6 +183,23 @@ class TestObsidianUri(AgentTestBase):
         code, _, _ = self.get(link.split("agent.test:27200", 1)[-1])
         self.assertEqual(code, 400)
 
+    def test_go_refuses_windows_and_other_absolute_paths(self):
+        for bad in ("C:\\Users\\r\\secret.md", "C:/Users/r/secret.md", "c:secret.md",
+                    "\\\\host\\share\\x.md", "/etc/x.md", "wiki/../../x.md"):
+            link = va.build_go_link(self.cfg, "desk", bad)
+            code, headers, _ = self.get(link.split("agent.test:27200", 1)[-1])
+            self.assertEqual(code, 400, bad)
+            self.assertNotIn("Location", headers)
+
+    def test_go_encodes_hostile_values_into_one_file_parameter(self):
+        note = "wiki/a&vault=other&file=x\r\nSet-Cookie: y#é.md"
+        link = va.build_go_link(self.cfg, "desk", note)
+        code, headers, _ = self.get(link.split("agent.test:27200", 1)[-1])
+        self.assertEqual(code, 302)
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(headers["Location"]).query)
+        self.assertEqual(q, {"vault": ["Mon vault & co"], "file": [note]})
+        self.assertNotIn("Set-Cookie", headers)
+
     def test_view_without_note_opens_the_vault(self):
         data, _ = self.mint("vault=desk")
         self.assertEqual(data["url"], "obsidian://open?vault=Mon%20vault%20%26%20co")
@@ -198,6 +215,14 @@ class TestObsidianUri(AgentTestBase):
             with open(p, "w") as f:
                 json.dump({"vaults": {"desk": {"open_mode": "obsidian-uri", "obsidian_vault": "V"}}}, f)
             self.assertIn("desk", va.load_config(p)["vaults"])
+            with open(p, "w") as f:
+                json.dump({"vaults": {"desk": {"open_mode": "obsidian-uri", "obsidian_vault": "   "}}}, f)
+            with self.assertRaises(ValueError):
+                va.load_config(p)
+            with open(p, "w") as f:  # the exemption is for obsidian-uri only
+                json.dump({"vaults": {"a": {"open_mode": "none"}}}, f)
+            with self.assertRaises(ValueError):
+                va.load_config(p)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
