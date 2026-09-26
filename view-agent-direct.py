@@ -499,7 +499,8 @@ def _mounts_identity(o):
     volume, each with its destination and volume subpath). Stable across `docker compose`
     recreations and image updates (unlike the container ID); different when another folder
     is mounted, or the same folders are swapped between destinations. It proves what Docker
-    mounts where, not the vault's content. None when the container mounts nothing."""
+    mounts where, not the vault's content. None when the container mounts nothing, or when
+    one bind/volume mount cannot be read (a partial digest could hide a substitution)."""
     mounts = o.get("Mounts")
     # A volume's subpath is only in the mount SPECS (HostConfig.Mounts, Compose long syntax),
     # keyed here by (type, source, destination) to join it back onto the resolved mounts.
@@ -516,16 +517,17 @@ def _mounts_identity(o):
     srcs = set()
     for m in (mounts if isinstance(mounts, list) else ()):
         if not isinstance(m, dict):
-            continue
+            return None
         kind = m.get("Type")
-        src = m.get("Name") if kind == "volume" else m.get("Source") if kind == "bind" else None
+        if kind not in ("bind", "volume"):
+            continue  # tmpfs, npipe…: no vault data
+        src = m.get("Name") if kind == "volume" else m.get("Source")
         dest = m.get("Destination")
         sub = subpaths.get((kind, src, dest), "")
-        if (isinstance(src, str) and src and _printable(src, 4096)
-                and isinstance(dest, str) and dest and _printable(dest, 4096)
-                and isinstance(sub, str) and (not sub or _printable(sub, 4096))):
-            # JSON of each triple: no separator can be forged inside a path.
-            srcs.add(json.dumps([kind, src, sub, dest], ensure_ascii=True))
+        if not (isinstance(src, str) and src and isinstance(dest, str) and dest and isinstance(sub, str)):
+            return None  # unreadable mount: never a partial identity
+        # JSON of each triple, control characters escaped: no path is ever dropped or merged.
+        srcs.add(json.dumps([kind, src, sub, dest], ensure_ascii=True))
     if not srcs:
         return None
     return hashlib.sha256("\n".join(sorted(srcs)).encode("utf-8")).hexdigest()[:16]
@@ -700,9 +702,26 @@ def _reachable(bind_ip, host):
     return (bind_ip == "0.0.0.0" and family == 4) or (bind_ip == "::" and family == 6)
 
 
+def _name_meets_explicit_ip(host, binds):
+    """A host NAME (not an IP, not localhost) cannot be matched against a publication on an
+    explicit IP: the name may resolve to that IP or not. Indeterminate → the caller refuses."""
+    if host == "localhost":
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        return any(hip not in _WILDCARD_IPS for hip in binds)
+
+
 def _detect_container(cfg, host, port, inventory, fresh=False):
     d = cfg["detect"]
-    hits = [c for c in inventory.containers(fresh)
+    containers = inventory.containers(fresh)
+    if _name_meets_explicit_ip(host, [hip for c in containers for hip, hp, _ in c["ports"] if hp == port]):
+        raise DetectError(400, "port %d is published on an explicit address and the router names this "
+                               "host %s: indeterminate, give the router an IP in the vault's baseUrl"
+                               % (port, host))
+    hits = [c for c in containers
             if any(hp == port and _reachable(hip, host) for hip, hp, _ in c["ports"])]
     if not hits:
         raise DetectError(400, "no running container publishes port %d on this host" % port)
@@ -711,7 +730,7 @@ def _detect_container(cfg, host, port, inventory, fresh=False):
                           % (port, ", ".join(sorted(c["name"] for c in hits))))
     c = hits[0]
     if not c.get("vault_id"):
-        raise DetectError(400, "container %s mounts nothing: no vault to identify" % c["name"])
+        raise DetectError(400, "container %s mounts nothing readable: no vault to identify" % c["name"])
     inner = {cp for hip, hp, cp in c["ports"] if hp == port and _reachable(hip, host)}
     if len(inner) != 1:
         raise DetectError(400, "container %s maps port %d ambiguously" % (c["name"], port))
@@ -722,6 +741,9 @@ def _detect_container(cfg, host, port, inventory, fresh=False):
         gui_host = _norm_host(urllib.parse.urlsplit(cfg["self_url"]).hostname or host)
     gui = None
     for gp in d["gui_container_ports"]:
+        if _name_meets_explicit_ip(gui_host, [hip for hip, hp, cp in c["ports"] if cp == gp]):
+            raise DetectError(400, "container %s publishes its GUI port %d on an explicit address and "
+                                   "the GUI host is the name %s: indeterminate" % (c["name"], gp, gui_host))
         published = {hp for hip, hp, cp in c["ports"] if cp == gp and _reachable(hip, gui_host)}
         if len(published) > 1:
             raise DetectError(400, "container %s publishes its GUI port %d several times" % (c["name"], gp))
@@ -780,8 +802,10 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
     nav = navigate_fn or navigate
     inventory = DockerInventory(cfg["detect"], docker_runner)
 
-    def resolve_view(vault, q):
-        """/view: (vault_cfg, hints) for a configured or detectable vault. Raises DetectError."""
+    def resolve_view(vault, q, token_verified):
+        """/view: (vault_cfg, hints) for a configured or detectable vault. Raises DetectError.
+        `token_verified`: this very request presented the token and it matched (never re-read
+        the file here: it may have appeared since the check)."""
         if vault in cfg["vaults"]:
             return cfg["vaults"][vault], None  # the manual entry wins, hints are ignored
         raw = {"rest": (q.get("rest") or [""])[0], "obsidian_name": (q.get("obsidian_name") or [""])[0]}
@@ -790,10 +814,10 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
         if not _printable(vault, 200):
             raise DetectError(400, "invalid vault name")
         # Detection needs both locks: only the router mints, and every link is signed.
-        locks = (read_secret_file(cfg, "token_file")[0], link_secret(cfg)[0])
-        if "error" in locks:
-            raise DetectError(503, "token or link-signing secret unreadable on the agent")
-        if locks != ("on", "on"):
+        sign_mode = link_secret(cfg)[0]
+        if sign_mode == "error":
+            raise DetectError(503, "link-signing secret unreadable on the agent")
+        if not token_verified or sign_mode != "on":
             raise DetectError(400, "vault detection requires token_file and a link-signing secret")
         hints = normalize_hints(raw)
         hints.pop("container", None)  # identity comes from Docker, never from the request
@@ -858,11 +882,12 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                     tok.encode("utf-8", "replace"),
                 ):
                     return self._send(401, {"error": "bad token"})
+                token_verified = tok is not None  # present at the check, and matched above
                 vault = (q.get("vault") or [""])[0]
                 note = (q.get("note") or [""])[0]
                 anchor = (q.get("h") or [""])[0]
                 try:
-                    vault_cfg, hints = resolve_view(vault, q)
+                    vault_cfg, hints = resolve_view(vault, q, token_verified)
                 except DetectError as e:
                     return self._send(e.code, {"error": e.msg, "vault": vault,
                                                "vaults": sorted(cfg["vaults"].keys())})
@@ -933,9 +958,10 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                # Failed navigation: say so instead of redirecting silently.
+                # Failed navigation: say so instead of redirecting silently. For a detected vault,
+                # no GUI link: the container may be gone and its GUI port reused by another vault.
                 return self._html(502, "Obsidian could not be navigated to “%s” (%s)."
-                                  % (note, detail), target)
+                                  % (note, detail), None if hints is not None else target)
 
             return self._send(404, {"error": "not found"})
 

@@ -583,6 +583,72 @@ class TestDetectContainer(DetectBase):
         self.docker.containers = [vault_on("alice")]                   # back: same identity
         self.assertEqual(self.get(path)[0], 302)
 
+    def test_control_characters_in_mount_paths_still_count(self):
+        conf = {"Type": "bind", "Source": "/srv/conf", "Destination": "/config"}
+        def on(src):
+            return container(ID_A, "obsidian-notes", {"27180/tcp": [("0.0.0.0", 27180)],
+                                                      "3001/tcp": [("0.0.0.0", 3001)]},
+                             mounts=[conf, {"Type": "bind", "Source": src, "Destination": "/vault"}])
+        self.docker.containers = [on("/srv/alice\n")]
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.docker.containers = [on("/srv/bob\n")]
+        self.assertEqual(self.get(path)[0], 409)
+
+    def test_unreadable_mount_makes_the_container_unidentifiable(self):
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("0.0.0.0", 27180)],
+                                                          "3001/tcp": [("0.0.0.0", 3001)]},
+                                            mounts=[{"Type": "bind", "Source": "/srv/conf", "Destination": "/config"},
+                                                    {"Type": "bind", "Source": None, "Destination": "/vault"}])]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("no vault to identify", json.loads(body)["error"])
+
+    def test_host_name_next_to_an_explicit_ip_publication_is_indeterminate(self):
+        self.cfg["detect"]["_local"].add("vaults.example")
+        self.docker.containers = [
+            container(ID_A, "one", {"27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}),
+            container(ID_B, "two", {"27180/tcp": [("2001:db8::1", 27180)], "3001/tcp": [("0.0.0.0", 3002)]}),
+        ]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://vaults.example:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("indeterminate", json.loads(body)["error"])
+
+    def test_host_name_with_wildcard_publications_only_is_detected(self):
+        self.cfg["detect"]["_local"].add("vaults.example")
+        data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://vaults.example:27180"))
+        self.assertEqual(data["source"], "container obsidian-notes")
+
+    def test_gui_on_an_explicit_ip_for_a_named_gui_host_is_indeterminate(self):
+        # loopback hint → GUI host = the self_url host, a NAME (agent.test)
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("127.0.0.1", 27180)],
+                                                          "3001/tcp": [("192.0.2.1", 3001)]})]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://127.0.0.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("indeterminate", json.loads(body)["error"])
+
+    def test_token_appearing_after_the_check_does_not_authorize_detection(self):
+        real = va.read_secret_file
+        seen = {"n": 0}
+
+        def racy(cfg, key):
+            if key == "token_file":
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    return ("off", None)          # absent at the /view check…
+            return real(cfg, key)                 # …present afterwards
+        va.read_secret_file = racy
+        try:
+            code, _, _ = self.get("/view?vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        finally:
+            va.read_secret_file = real
+        self.assertEqual(code, 400)
+
+    def test_failed_navigation_of_a_detected_vault_offers_no_gui_link(self):
+        _, path = self.mint("vault=notes&note=fail.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        code, _, body = self.get(path)
+        self.assertEqual(code, 502)
+        self.assertNotIn(b"href", body)
+
     def test_identity_fields_sent_to_view_are_ignored(self):
         data, _ = self.mint("vault=notes&note=a.md&container=evil&vault_id=" + "0" * 16
                             + "&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
