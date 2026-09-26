@@ -227,6 +227,351 @@ class TestObsidianUri(AgentTestBase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+ID_A = "a" * 64
+ID_B = "b" * 64
+
+
+def container(cid, name, ports, running=True):
+    """A `docker inspect` object; ports = {"<inner>/tcp": [(host_ip, host_port), ...]}."""
+    return {"Id": cid, "Name": "/" + name, "State": {"Running": running},
+            "NetworkSettings": {"Ports": {k: [{"HostIp": ip, "HostPort": str(p)} for ip, p in v]
+                                          for k, v in ports.items()}}}
+
+
+VAULTS_HOST = [
+    container(ID_A, "obsidian-notes", {"27180/tcp": [("0.0.0.0", 27180), ("::", 27180)],
+                                        "3001/tcp": [("0.0.0.0", 3001), ("::", 3001)]}),
+    container(ID_B, "obsidian-bob", {"27180/tcp": [("0.0.0.0", 27181)],
+                                           "3001/tcp": [("0.0.0.0", 3002)]}),
+]
+
+
+class FakeDocker:
+    """Records every argv and answers `docker ps` / `docker inspect` from `self.containers`."""
+
+    def __init__(self, containers):
+        self.containers = containers
+        self.cmds = []
+        self.ps_stdout = None       # override `docker ps` output
+        self.inspect_stdout = None  # override `docker inspect` output
+        self.raises = None          # exception raised by every call (docker missing)
+
+    def __call__(self, cmd):
+        self.cmds.append(list(cmd))
+        if self.raises:
+            raise self.raises
+
+        class R:
+            returncode, stderr = 0, ""
+        r = R()
+        if cmd[1] == "ps":
+            r.stdout = self.ps_stdout if self.ps_stdout is not None else \
+                "".join(c["Id"] + "\n" for c in self.containers)
+        elif cmd[1] == "inspect":
+            r.stdout = self.inspect_stdout if self.inspect_stdout is not None else \
+                json.dumps([c for c in self.containers if c["Id"] in cmd[4:]])
+        else:
+            raise AssertionError("unexpected docker command %r" % cmd)
+        return r
+
+
+class DetectBase(AgentTestBase):
+    """Agent on 192.0.2.1 (the server), reader's desktop on 192.0.2.10. `alice` stays
+    configured; everything else is detected from the router's hints."""
+    EXTRA = {"bind": "192.0.2.1", "detect": {"desktop_hosts": ["192.0.2.10"], "cache_s": 0}}
+    CONTAINERS = VAULTS_HOST
+
+    def setUp(self):
+        self.docker = FakeDocker([dict(c) for c in self.CONTAINERS])
+        super().setUp()
+
+
+def _serve_with_docker(self):
+    """AgentTestBase.setUp builds the server without a docker runner: rebuild it with one."""
+    self.srv.shutdown()
+    self.srv.server_close()
+
+    def fake_nav(vault_cfg, note, anchor=""):
+        self.calls.append((note, anchor))
+        self.nav_cfgs.append(vault_cfg)
+        return (not note.startswith("fail"), "test")
+
+    self.nav_cfgs = []
+    self.srv = ThreadingHTTPServer(("127.0.0.1", 0), va.make_handler(self.cfg, fake_nav, self.docker))
+    self.base = "http://127.0.0.1:%d" % self.srv.server_address[1]
+    threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+
+class TestDetectContainer(DetectBase):
+    def setUp(self):
+        super().setUp()
+        _serve_with_docker(self)
+
+    def view(self, query):
+        return self.get("/view?" + query, {"X-View-Token": "tok-123"})
+
+    def test_container_vault_is_detected_and_navigated_by_id(self):
+        data, path = self.mint("vault=notes&note=wiki/a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(data["open_mode"], "docker-exec")
+        self.assertEqual(data["source"], "container obsidian-notes")
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)
+        self.assertEqual(q["r"], ["http://192.0.2.1:27180"])
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 302)
+        self.assertEqual(headers["Location"], "https://192.0.2.1:3001/")
+        self.assertEqual(self.nav_cfgs[-1]["container"], ID_A)       # the hex ID, not a name
+        self.assertEqual(self.nav_cfgs[-1]["open_port"], 27180)
+
+    def test_published_port_maps_to_the_inner_port_and_its_gui(self):
+        data, path = self.mint("vault=bob&note=a.md&rest=" + urllib.parse.quote("https://192.0.2.1:27181"))
+        code, headers, _ = self.get(path)
+        self.assertEqual(headers["Location"], "https://192.0.2.1:3002/")
+        self.assertEqual(self.nav_cfgs[-1]["container"], ID_B)
+        self.assertEqual(self.nav_cfgs[-1]["open_port"], 27180)       # inside the container
+
+    def test_docker_is_only_called_with_fixed_argv(self):
+        self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(self.docker.cmds, [
+            ["docker", "ps", "--no-trunc", "-q"],
+            ["docker", "inspect", "--type", "container", ID_A, ID_B],
+        ])
+
+    def test_manual_config_wins_over_detection(self):
+        data, path = self.mint("vault=alice&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(data["source"], "config")
+        self.assertNotIn("r=", data["url"])
+        code, headers, _ = self.get(path)
+        self.assertEqual(headers["Location"], "https://gui.test:3001/")
+        self.assertEqual(self.docker.cmds, [])
+
+    def test_unknown_vault_without_hints_is_still_400(self):
+        code, _, body = self.view("vault=x&note=a.md")
+        self.assertEqual(code, 400)
+        self.assertEqual(json.loads(body)["error"], "unknown vault")
+
+    def test_no_container_on_that_port_is_an_explicit_400(self):
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27999"))
+        self.assertEqual(code, 400)
+        self.assertIn("27999", json.loads(body)["error"])
+
+    def test_port_published_on_another_ip_does_not_match(self):
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("127.0.0.1", 27180)],
+                                                          "3001/tcp": [("0.0.0.0", 3001)]})]
+        code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+
+    def test_two_containers_on_one_port_is_ambiguous(self):
+        self.docker.containers = [
+            container(ID_A, "one", {"27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]}),
+            container(ID_B, "two", {"27180/tcp": [("192.0.2.1", 27180)], "3001/tcp": [("0.0.0.0", 3002)]}),
+        ]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("one, two", json.loads(body)["error"])
+
+    def test_container_without_gui_port_is_an_explicit_400(self):
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("0.0.0.0", 27180)]})]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("GUI", json.loads(body)["error"])
+
+    def test_stopped_container_is_ignored(self):
+        self.docker.containers = [dict(VAULTS_HOST[0], State={"Running": False})]
+        code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+
+    def test_unexpected_docker_ps_output_fails_closed_before_inspect(self):
+        self.docker.ps_stdout = ID_A + "\n--format={{.Name}};id\n"
+        code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 503)
+        self.assertEqual([c[1] for c in self.docker.cmds], ["ps"])
+
+    def test_inspect_object_with_a_forged_id_is_ignored(self):
+        forged = container("c" * 64, "evil", {"27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]})
+        self.docker.ps_stdout = ID_A + "\n"             # ps never listed c…c
+        self.docker.inspect_stdout = json.dumps([forged])
+        code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+
+    def test_docker_unavailable_is_503(self):
+        self.docker.raises = FileNotFoundError("docker")
+        code, _, _ = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 503)
+
+    def test_go_redetects_and_explains_when_the_container_is_gone(self):
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.docker.containers = []
+        code, headers, body = self.get(path)
+        self.assertEqual(code, 502)
+        self.assertNotIn("Location", headers)
+        self.assertIn(b"27180", body)
+        self.assertEqual(self.calls, [])
+
+    def test_hint_is_covered_by_the_signature(self):
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        tampered = path.replace("27180", "27181")
+        self.assertEqual(self.get(tampered)[0], 403)
+        stripped = "&".join(p for p in path.split("&") if not p.startswith("r="))
+        self.assertEqual(self.get(stripped)[0], 403)
+        self.assertEqual(self.calls, [])
+
+    def test_hint_cannot_be_added_to_a_legacy_link(self):
+        link = va.build_go_link(self.cfg, "ghost", "a.md")    # legacy format, unknown vault
+        path = link.split("agent.test:27200", 1)[-1] + "&r=" + urllib.parse.quote("http://192.0.2.1:27180")
+        self.assertEqual(self.get(path)[0], 403)
+
+    def test_loopback_hint_uses_the_readers_host_for_the_gui(self):
+        _, path = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://127.0.0.1:27180"))
+        self.assertEqual(self.get(path)[1]["Location"], "https://agent.test:3001/")
+
+    def test_docker_inventory_is_cached(self):
+        self.cfg["detect"]["cache_s"] = 60
+        for _ in range(3):
+            self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual([c[1] for c in self.docker.cmds], ["ps", "inspect"])
+
+
+class TestDetectDesktop(DetectBase):
+    def setUp(self):
+        super().setUp()
+        _serve_with_docker(self)
+
+    def test_desktop_vault_redirects_to_obsidian_without_docker(self):
+        data, path = self.mint("vault=carol&note=wiki/a.md&rest=" + urllib.parse.quote("http://192.0.2.10:27190")
+                               + "&obsidian_name=" + urllib.parse.quote("Carol notes et co"))
+        self.assertEqual(data["open_mode"], "obsidian-uri")
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 302)
+        self.assertEqual(headers["Location"],
+                         "obsidian://open?vault=Carol%20notes%20et%20co&file=wiki%2Fa.md")
+        self.assertEqual(self.docker.cmds, [])
+        self.assertEqual(self.calls, [])
+
+    def test_obsidian_name_is_covered_by_the_signature(self):
+        _, path = self.mint("vault=carol&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.10:27190")
+                            + "&obsidian_name=Real")
+        self.assertEqual(self.get(path.replace("o=Real", "o=Other"))[0], 403)
+
+    def test_desktop_vault_without_obsidian_name_is_an_explicit_400(self):
+        code, _, body = self.get("/view?vault=carol&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.10:27190"),
+                                 {"X-View-Token": "tok-123"})
+        self.assertEqual(code, 400)
+        self.assertIn("obsidian_name", json.loads(body)["error"])
+
+    def test_unlisted_remote_host_is_never_guessed(self):
+        code, _, body = self.get("/view?vault=r&note=a.md&obsidian_name=X&rest="
+                                 + urllib.parse.quote("http://192.0.2.11:27190"), {"X-View-Token": "tok-123"})
+        self.assertEqual(code, 400)
+        self.assertIn("cannot classify", json.loads(body)["error"])
+
+    def test_desktop_link_without_note_opens_the_vault(self):
+        data, _ = self.mint("vault=carol&rest=" + urllib.parse.quote("http://192.0.2.10:27190")
+                            + "&obsidian_name=V")
+        self.assertEqual(data["url"], "obsidian://open?vault=V")
+
+    def test_desktop_go_still_refuses_traversal(self):
+        hints = {"rest": "http://192.0.2.10:27190", "obsidian_name": "V"}
+        link = va.build_go_link(self.cfg, "router", "../x.md", "", hints)
+        self.assertEqual(self.get(link.split("agent.test:27200", 1)[-1])[0], 400)
+
+    def test_invalid_obsidian_name_is_refused(self):
+        for bad in ("a\nb", " lead", "x" * 256):
+            code, _, _ = self.get("/view?vault=r&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.10:1")
+                                  + "&obsidian_name=" + urllib.parse.quote(bad), {"X-View-Token": "tok-123"})
+            self.assertEqual(code, 400, repr(bad))
+
+
+class TestDetectNeedsLocks(DetectBase):
+    """Without a token AND a signing secret, detection is refused (links always signed)."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(self.dir, "view-agent.token"))     # no token, no secret at all
+        _serve_with_docker(self)
+
+    def test_detection_refused_without_secrets(self):
+        code, _, body = self.get("/view?vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("requires", json.loads(body)["error"])
+        self.assertEqual(self.docker.cmds, [])
+
+    def test_unsigned_hint_link_is_refused_at_go(self):
+        path = "/go?v=x&n=a.md&r=" + urllib.parse.quote("http://192.0.2.1:27180")
+        self.assertEqual(self.get(path)[0], 403)
+        self.assertEqual(self.docker.cmds, [])
+
+    def test_configured_vault_keeps_working_unsigned(self):
+        self.assertEqual(self.get("/go?v=alice&n=a.md")[0], 302)
+
+
+class TestDetectPure(unittest.TestCase):
+    def test_rest_hint_refusals(self):
+        for bad in ("ftp://192.0.2.1:21", "http://u:p@192.0.2.1:27180", "http://192.0.2.1@evil:27180",
+                    "http://192.0.2.1", "http://192.0.2.1:27180/x", "http://192.0.2.1:27180?a=1",
+                    "http://192.0.2.1:27180#f", "http://192.0.2.1:99999", "http://bad_host:1",
+                    "http://192.0.2.1:27180\\@x", "http://a b:1", "http://x:1\n", "", "192.0.2.1:27180",
+                    "http://$(id):1", "http://-x:1"):
+            with self.assertRaises(va.DetectError, msg=bad):
+                va.parse_rest_hint(bad)
+
+    def test_rest_hint_normalization(self):
+        self.assertEqual(va.parse_rest_hint("HTTP://LocalHost:27180/"), ("http://localhost:27180", "localhost", 27180))
+        self.assertEqual(va.parse_rest_hint("https://[::1]:27124")[0], "https://[::1]:27124")
+
+    def test_desktop_hosts_accept_cidr_and_names(self):
+        nets = va._load_detect({"desktop_hosts": ["192.0.2.0/28", "pc.wg"]})["_desktop"]
+        self.assertTrue(va._host_in("192.0.2.10", nets))
+        self.assertFalse(va._host_in("192.0.2.17", nets))
+        self.assertTrue(va._host_in("pc.wg", nets))
+        self.assertFalse(va._host_in("::1", nets))
+
+    def test_detect_config_validation(self):
+        for bad in ({"desktop_hosts": ["not a host!"]}, {"gui_url": "https://{host.__class__}:{port}/"},
+                    {"gui_url": "https://x/"}, {"gui_url": "file:///{port}"}, {"bogus": 1},
+                    {"gui_container_ports": []}, {"gui_container_ports": [True]}, {"enabled": "yes"},
+                    {"cache_s": -1}, {"local_hosts": "192.0.2.1"}):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                va._load_detect(bad)
+
+    def test_a_host_cannot_be_both_local_and_desktop(self):
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, "config.json")
+            with open(p, "w") as f:
+                json.dump({"bind": "192.0.2.1", "vaults": {}, "detect": {"desktop_hosts": ["192.0.2.0/24"]}}, f)
+            with self.assertRaises(ValueError):
+                va.load_config(p)
+            with open(p, "w") as f:  # detection lets "vaults" be empty; disabling it does not
+                json.dump({"vaults": {}, "detect": {"enabled": False}}, f)
+            with self.assertRaises(ValueError):
+                va.load_config(p)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_detected_container_navigates_by_id_with_fixed_argv(self):
+        seen = {}
+
+        class R:
+            returncode, stdout, stderr = 0, "200", ""
+
+        def runner(cmd):
+            seen["cmd"] = cmd
+            return R()
+        ok, _ = va.navigate({"open_mode": "docker-exec", "container": ID_A, "open_port": 27180,
+                             "docker_path": "docker", "curl_path": "curl"}, "wiki/a b.md", "", runner)
+        self.assertTrue(ok)
+        self.assertEqual(seen["cmd"], ["docker", "exec", ID_A, "curl", "-sS", "-o", "/dev/null", "-w",
+                                       "%{http_code}", "--max-time", "4",
+                                       "http://127.0.0.1:27180/open/wiki%2Fa%20b.md"])
+
+    def test_canonical_v2_is_unambiguous_and_separate_from_legacy(self):
+        h = {"rest": "http://192.0.2.1:27180"}
+        # The legacy newline join collides here: note "a\nb" vs note "a" + anchor "b\n".
+        self.assertEqual(va._canonical("v", "a\nb", "", 0), va._canonical("v", "a", "b\n", 0))
+        self.assertNotEqual(va._canonical("v", "a\nb", "", 0, h), va._canonical("v", "a", "b\n", 0, h))
+        self.assertNotEqual(va._canonical("v", "a", "", 0, h), va._canonical("v", "a", "", 0))
+
+
 class TestPure(unittest.TestCase):
     def test_refused_paths(self):
         self.assertIsNone(va._safe_note("../x.md"))

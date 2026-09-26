@@ -33,6 +33,25 @@ note write, and navigating there would make Obsidian jump on each write. Set
 `navigate_on_view: true` to navigate on both. See docs/CONTRACT.md, "Providers without a
 tunnel".
 
+Vault detection
+---------------
+A vault absent from `vaults` is classified from what the router knows about it, passed as
+two optional /view parameters (docs/CONTRACT.md, "Vault hints"):
+
+    rest=<scheme://host:port>   the vault's Local REST API origin, as the router reaches it
+    obsidian_name=<label>       the vault's name in Obsidian (obsidian://open?vault=)
+
+    host is this agent's host  → the ONE running container publishing that port
+                                 → docker-exec on it + redirect to its published GUI port
+    host is in desktop_hosts   → obsidian-uri (requires obsidian_name)
+    anything else              → explicit 4xx, never a guessed link
+
+Both hints are copied into the /go link and covered by its signature; /go re-runs the
+detection on click, so a recreated container is found again. The manual `vaults` entry
+always wins. Docker is only queried with fixed argument lists; the container is then
+addressed by its validated hex ID, never by a string taken from the request.
+
+
 Routes
 ------
     GET /health   — token-free, leaks nothing actionable (served vault names only)
@@ -54,11 +73,14 @@ Python 3.8+ stdlib only — no pip dependencies. Configuration: see config.direc
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import ntpath
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -80,8 +102,28 @@ DEFAULT_CONFIG = {
     # Also navigate Obsidian when /view is called. Off by default: the router calls /view
     # on every note write, which would make Obsidian jump on each write.
     "navigate_on_view": False,
-    # vault name -> per-vault settings; see config.direct.example.json.
+    # vault name -> per-vault settings; see config.direct.example.json. Wins over detection.
     "vaults": {},
+    # Classification of vaults absent from "vaults"; see DETECT_DEFAULTS.
+    "detect": {},
+}
+
+DETECT_DEFAULTS = {
+    "enabled": True,
+    # Hosts that designate THIS machine in a router `rest` hint, besides loopback, `bind`
+    # and the host of `self_url`.
+    "local_hosts": [],
+    # Hosts (IP, CIDR or name) whose vaults are opened in the reader's desktop Obsidian.
+    # Empty: no vault is ever classified as a desktop one.
+    "desktop_hosts": [],
+    # Container-side port(s) of the web GUI (linuxserver/obsidian: 3001 = HTTPS), first hit wins.
+    "gui_container_ports": [3001],
+    # Reader-side GUI URL; {host} = host of the rest hint, {port} = the published GUI port.
+    "gui_url": "https://{host}:{port}/",
+    # Seconds a Docker inventory is reused (the eager /view path runs on every note write).
+    "cache_s": 10,
+    "docker_path": "docker",
+    "curl_path": "curl",
 }
 
 VAULT_REQUIRED = ("public_url",)       # except open_mode obsidian-uri (see load_config)
@@ -111,8 +153,9 @@ def load_config(path):
     cfg.update(raw or {})
     cfg["_dir"] = os.path.dirname(os.path.abspath(path))
 
-    if not isinstance(cfg.get("vaults"), dict) or not cfg["vaults"]:
-        raise ValueError('config requires a non-empty "vaults" object')
+    cfg["detect"] = _load_detect(cfg.get("detect"))
+    if not isinstance(cfg.get("vaults"), dict) or not (cfg["vaults"] or cfg["detect"]["enabled"]):
+        raise ValueError('config requires a non-empty "vaults" object (or detection enabled)')
     for name, v in cfg["vaults"].items():
         if not isinstance(v, dict):
             raise ValueError('vault "%s": must be an object' % name)
@@ -140,7 +183,84 @@ def load_config(path):
     if not cfg.get("self_url"):
         cfg["self_url"] = "http://%s:%d" % (cfg["bind"], cfg["port"])
     cfg["self_url"] = cfg["self_url"].rstrip("/")
+    d = cfg["detect"]
+    local = {"127.0.0.1", "::1", "localhost"}
+    for h in [cfg["bind"], urllib.parse.urlsplit(cfg["self_url"]).hostname] + d["local_hosts"]:
+        if h and h not in ("0.0.0.0", "::"):
+            local.add(_norm_host(h))
+    d["_local"] = local
+    clash = [h for h in local if _host_in(h, d["_desktop"])]
+    if clash:
+        raise ValueError('detect: %s is both local and in "desktop_hosts"' % ", ".join(sorted(clash)))
     return cfg
+
+
+def _norm_host(h):
+    h = str(h).strip().lower().rstrip(".")
+    try:
+        return str(ipaddress.ip_address(h.strip("[]")))
+    except ValueError:
+        return h
+
+
+_HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)*$")
+
+
+def _load_detect(raw):
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError('"detect" must be an object')
+    unknown = [k for k in raw if not k.startswith("_") and k not in DETECT_DEFAULTS]
+    if unknown:
+        raise ValueError('detect: unknown key(s) %s' % ", ".join(unknown))
+    d = dict(DETECT_DEFAULTS)
+    d.update({k: v for k, v in raw.items() if not k.startswith("_")})
+    if not isinstance(d["enabled"], bool):
+        raise ValueError('detect.enabled must be true or false')
+    for k in ("local_hosts", "desktop_hosts"):
+        if not isinstance(d[k], list) or not all(isinstance(h, str) and h.strip() for h in d[k]):
+            raise ValueError('detect.%s must be a list of non-empty strings' % k)
+    desktop = []
+    for h in d["desktop_hosts"]:
+        try:
+            desktop.append(ipaddress.ip_network(h.strip(), strict=False))
+        except ValueError:
+            n = _norm_host(h)
+            if not _HOSTNAME_RE.match(n):
+                raise ValueError('detect.desktop_hosts: "%s" is neither an IP, a CIDR nor a host name' % h)
+            desktop.append(n)
+    d["_desktop"] = desktop
+    ports = d["gui_container_ports"]
+    if (not isinstance(ports, list) or not ports
+            or not all(isinstance(p, int) and not isinstance(p, bool) and 0 < p < 65536 for p in ports)):
+        raise ValueError('detect.gui_container_ports must be a non-empty list of ports')
+    g = d["gui_url"]
+    if not (isinstance(g, str) and g.startswith(("http://", "https://")) and "{port}" in g):
+        raise ValueError('detect.gui_url must be an http(s) URL template containing {port}')
+    if re.search(r"[{}]", g.replace("{host}", "").replace("{port}", "")):
+        raise ValueError('detect.gui_url may only use the {host} and {port} fields')
+    if not isinstance(d["cache_s"], (int, float)) or isinstance(d["cache_s"], bool) or d["cache_s"] < 0:
+        raise ValueError('detect.cache_s must be a number >= 0')
+    for k in ("docker_path", "curl_path"):
+        if not (isinstance(d[k], str) and d[k].strip()):
+            raise ValueError('detect.%s must be a non-empty string' % k)
+    return d
+
+
+def _host_in(host, entries):
+    """host (normalized) matches a desktop_hosts entry: same name, or IP inside the network."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    for e in entries:
+        if isinstance(e, str):
+            if e == host:
+                return True
+        elif ip is not None and ip.version == e.version and ip in e:
+            return True
+    return False
 
 
 def _resolve(cfg, p):
@@ -179,57 +299,80 @@ def link_secret(cfg):
 
 # ----------------------------------------------------------------------------- signed links
 
-def _canonical(vault, note, anchor, exp):
+def _canonical(vault, note, anchor, exp, hints=None):
+    if hints:
+        # Links carrying detection hints: an unambiguous encoding (JSON never contains a
+        # raw newline), in a domain the legacy format below can never produce. Stripping
+        # the hints from such a link therefore breaks its signature.
+        return "v2\n" + json.dumps([vault, note, anchor or "", int(exp or 0),
+                                    hints.get("rest", ""), hints.get("obsidian_name", "")],
+                                   ensure_ascii=True, separators=(",", ":"))
     return "\n".join([vault, note, anchor or "", str(exp or 0)])
 
 
-def sign(secret, vault, note, anchor, exp):
-    mac = hmac.new(secret.encode("utf-8"), _canonical(vault, note, anchor, exp).encode("utf-8"),
+def sign(secret, vault, note, anchor, exp, hints=None):
+    mac = hmac.new(secret.encode("utf-8"), _canonical(vault, note, anchor, exp, hints).encode("utf-8"),
                    hashlib.sha256)
     return mac.hexdigest()[:40]
 
 
-def build_go_link(cfg, vault, note, anchor=""):
-    """Compose the /go link. Signed when a secret exists; expiry from link_ttl_s."""
+def build_go_link(cfg, vault, note, anchor="", hints=None):
+    """Compose the /go link. Signed when a secret exists; expiry from link_ttl_s.
+    `hints` (rest / obsidian_name) are for detected vaults, which require a signature."""
     exp = int(time.time()) + cfg["link_ttl_s"] if cfg["link_ttl_s"] else 0
     params = [("v", vault), ("n", note)]
     if anchor:
         params.append(("h", anchor))
     if exp:
         params.append(("e", str(exp)))
+    if hints:
+        if hints.get("rest"):
+            params.append(("r", hints["rest"]))
+        if hints.get("obsidian_name"):
+            params.append(("o", hints["obsidian_name"]))
     mode, secret = link_secret(cfg)
     if mode == "error":
         raise RuntimeError("link-signing secret unreadable")
     if mode == "on":
-        params.append(("s", sign(secret, vault, note, anchor, exp)))
+        params.append(("s", sign(secret, vault, note, anchor, exp, hints)))
+    elif hints:
+        raise RuntimeError("detected vaults require a link-signing secret")
     return "%s/go?%s" % (cfg["self_url"], urllib.parse.urlencode(params))
 
 
 def verify_go(cfg, q):
-    """Returns (ok, code, message, vault, note, anchor)."""
+    """Returns (ok, code, message, vault, note, anchor, hints). `hints` is None for a
+    configured vault (the manual entry wins, whatever the link carries)."""
     vault = (q.get("v") or [""])[0]
     note = (q.get("n") or [""])[0]
     anchor = (q.get("h") or [""])[0]
     exp_s = (q.get("e") or ["0"])[0]
     sig = (q.get("s") or [""])[0]
+    hints = {k: (q.get(p) or [""])[0] for k, p in (("rest", "r"), ("obsidian_name", "o"))}
+    hints = {k: v for k, v in hints.items() if v} or None
     if not vault or not note:
-        return (False, 400, "parameters v and n are required", vault, note, anchor)
+        return (False, 400, "parameters v and n are required", vault, note, anchor, None)
     try:
         exp = int(exp_s)
     except ValueError:
-        return (False, 400, "invalid parameter e", vault, note, anchor)
+        return (False, 400, "invalid parameter e", vault, note, anchor, None)
     mode, secret = link_secret(cfg)
     if mode == "error":
-        return (False, 503, "link-signing secret unreadable on the agent", vault, note, anchor)
+        return (False, 503, "link-signing secret unreadable on the agent", vault, note, anchor, None)
     if mode == "on":
-        expected = sign(secret, vault, note, anchor, exp)
+        expected = sign(secret, vault, note, anchor, exp, hints)
         if not hmac.compare_digest(sig.encode("utf-8", "replace"), expected.encode("utf-8")):
-            return (False, 403, "bad signature", vault, note, anchor)
+            return (False, 403, "bad signature", vault, note, anchor, None)
+    elif hints:
+        # Never act on unsigned hints, even on an agent that tolerates unsigned links.
+        return (False, 403, "detected vaults require a signed link", vault, note, anchor, None)
     if exp and time.time() > exp:
-        return (False, 410, "link expired", vault, note, anchor)
-    if vault not in cfg["vaults"]:
-        return (False, 404, "unknown vault", vault, note, anchor)
-    return (True, 200, "", vault, note, anchor)
+        return (False, 410, "link expired", vault, note, anchor, None)
+    if vault in cfg["vaults"]:
+        return (True, 200, "", vault, note, anchor, None)
+    if not hints:
+        return (False, 404, "unknown vault", vault, note, anchor, None)
+    return (True, 200, "", vault, note, anchor, hints)
 
 
 # ----------------------------------------------------------------------------- navigation
@@ -295,16 +438,235 @@ def navigate(vault_cfg, note, anchor="", runner=None):
     return (False, "unknown mode")
 
 
+# ----------------------------------------------------------------------------- detection
+
+class DetectError(Exception):
+    """A vault that cannot be classified. `code` follows the contract: 4xx = this vault
+    (does not trip the router's breaker), 5xx = the agent's own health (Docker down)."""
+
+    def __init__(self, code, msg):
+        Exception.__init__(self, msg)
+        self.code = code
+        self.msg = msg
+
+
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_PORT_KEY_RE = re.compile(r"^([0-9]{1,5})/tcp$")
+_WILDCARD_IPS = ("", "0.0.0.0", "::")
+
+
+def _printable(s, limit):
+    return isinstance(s, str) and 0 < len(s) <= limit and not any(ord(c) < 0x20 or ord(c) == 0x7f for c in s)
+
+
+def parse_rest_hint(value):
+    """Router's `rest` hint → (origin, host, port). Only scheme://host:port is accepted:
+    no credentials, no path, no query, an explicit port, a host that is an IP or a name."""
+    if not _printable(value, 300) or " " in value or "\\" in value:
+        raise DetectError(400, "rest hint: not a plain URL")
+    u = urllib.parse.urlsplit(value)
+    if u.scheme.lower() not in ("http", "https"):
+        raise DetectError(400, "rest hint: scheme must be http or https")
+    if "@" in u.netloc:
+        raise DetectError(400, "rest hint: must not carry credentials")
+    if u.path not in ("", "/") or u.query or u.fragment:
+        raise DetectError(400, "rest hint: must be an origin (scheme://host:port), nothing more")
+    try:
+        port = u.port
+    except ValueError:
+        port = None
+    if not port:
+        raise DetectError(400, "rest hint: an explicit port is required")
+    host = _norm_host(u.hostname or "")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not _HOSTNAME_RE.match(host):
+            raise DetectError(400, "rest hint: invalid host")
+    shown = "[%s]" % host if ":" in host else host
+    return ("%s://%s:%d" % (u.scheme.lower(), shown, port), host, port)
+
+
+def normalize_hints(raw):
+    """Validated, canonical hints (only the ones present). Raises DetectError."""
+    hints = {}
+    if raw.get("rest"):
+        hints["rest"] = parse_rest_hint(raw["rest"])[0]
+    name = raw.get("obsidian_name")
+    if name:
+        if not _printable(name, 255) or name != name.strip():
+            raise DetectError(400, "obsidian_name hint: invalid vault name")
+        hints["obsidian_name"] = name
+    return hints
+
+
+def _run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+
+
+class DockerInventory:
+    """Running containers and their published TCP ports, from two fixed commands:
+    `docker ps --no-trunc -q` then `docker inspect <validated ids>`. Cached `cache_s`."""
+
+    def __init__(self, detect_cfg, runner=None):
+        self.d = detect_cfg
+        self.runner = runner or _run
+        self.lock = threading.Lock()
+        self.at = 0.0
+        self.data = None
+
+    def containers(self):
+        with self.lock:
+            now = time.monotonic()
+            if self.data is not None and now - self.at < self.d["cache_s"]:
+                return self.data
+            self.data = self._probe()  # an error propagates and caches nothing
+            self.at = now
+            return self.data
+
+    def _call(self, args):
+        try:
+            r = self.runner([self.d["docker_path"]] + args)
+        except Exception as e:
+            raise DetectError(503, "docker unavailable: %s" % str(e)[:120])
+        return r
+
+    def _probe(self):
+        r = self._call(["ps", "--no-trunc", "-q"])
+        if r.returncode != 0:
+            raise DetectError(503, "docker ps failed: %s" % (r.stderr or "").strip()[:160])
+        ids = [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
+        if not all(_CONTAINER_ID_RE.match(i) for i in ids):
+            raise DetectError(503, "docker ps: unexpected output")
+        if not ids:
+            return []
+        r = self._call(["inspect", "--type", "container"] + ids)
+        try:
+            objs = json.loads(r.stdout or "")
+        except ValueError:
+            objs = None
+        if not isinstance(objs, list):  # a container that vanished in between still leaves valid JSON
+            raise DetectError(503, "docker inspect failed: %s" % (r.stderr or "").strip()[:160])
+        out = []
+        for o in objs:
+            if not isinstance(o, dict):
+                continue
+            cid = o.get("Id")
+            if not (isinstance(cid, str) and _CONTAINER_ID_RE.match(cid) and cid in ids):
+                continue
+            if not (o.get("State") or {}).get("Running"):
+                continue
+            name = str(o.get("Name") or "").lstrip("/")
+            if not _CONTAINER_NAME_RE.match(name):
+                name = cid[:12]
+            ports = []
+            for key, binds in ((o.get("NetworkSettings") or {}).get("Ports") or {}).items():
+                m = _PORT_KEY_RE.match(str(key))
+                if not m or not isinstance(binds, list):
+                    continue
+                cport = int(m.group(1))
+                for b in binds:
+                    hp = str((b or {}).get("HostPort") or "")
+                    if not (hp.isdigit() and len(hp) <= 5 and 0 < int(hp) < 65536 and 0 < cport < 65536):
+                        continue
+                    hip = str((b or {}).get("HostIp") or "")
+                    ports.append((_norm_host(hip) if hip else "", int(hp), cport))
+            out.append({"id": cid, "name": name, "ports": ports})
+        return out
+
+
+def _reachable(bind_ip, host):
+    return bind_ip in _WILDCARD_IPS or bind_ip == host
+
+
+def _detect_container(cfg, host, port, inventory):
+    d = cfg["detect"]
+    hits = [c for c in inventory.containers()
+            if any(hp == port and _reachable(hip, host) for hip, hp, _ in c["ports"])]
+    if not hits:
+        raise DetectError(400, "no running container publishes port %d on this host" % port)
+    if len(hits) > 1:
+        raise DetectError(400, "port %d is published by several containers (%s)"
+                          % (port, ", ".join(sorted(c["name"] for c in hits))))
+    c = hits[0]
+    inner = {cp for hip, hp, cp in c["ports"] if hp == port and _reachable(hip, host)}
+    if len(inner) != 1:
+        raise DetectError(400, "container %s maps port %d ambiguously" % (c["name"], port))
+    gui = None
+    for gp in d["gui_container_ports"]:
+        published = {hp for hip, hp, cp in c["ports"] if cp == gp and _reachable(hip, host)}
+        if len(published) > 1:
+            raise DetectError(400, "container %s publishes its GUI port %d several times" % (c["name"], gp))
+        if published:
+            gui = published.pop()
+            break
+    if gui is None:
+        raise DetectError(400, "container %s publishes no GUI port (detect.gui_container_ports)" % c["name"])
+    # {host}: where the router reached the vault — unless that is loopback, which means
+    # nothing to the reader's browser: then the host the reader already uses for /go.
+    gui_host = host
+    if host in ("127.0.0.1", "::1", "localhost"):
+        gui_host = urllib.parse.urlsplit(cfg["self_url"]).hostname or host
+    shown = "[%s]" % gui_host if ":" in gui_host else gui_host
+    return {
+        "open_mode": "docker-exec",
+        "container": c["id"],             # validated hex ID, never a string from the request
+        "open_port": inner.pop(),
+        "public_url": d["gui_url"].replace("{host}", shown).replace("{port}", str(gui)),
+        "docker_path": d["docker_path"],
+        "curl_path": d["curl_path"],
+        "_detected": "container %s" % c["name"],
+    }
+
+
+def detect_vault(cfg, hints, inventory):
+    """Classify a vault absent from `vaults` from normalized hints → a vault config.
+    Raises DetectError; never returns a guess."""
+    d = cfg["detect"]
+    if not d["enabled"]:
+        raise DetectError(400, "unknown vault (detection disabled)")
+    if not hints.get("rest"):
+        raise DetectError(400, "unknown vault: not configured, and the router sent no rest hint")
+    _, host, port = parse_rest_hint(hints["rest"])
+    if host in d["_local"]:
+        return _detect_container(cfg, host, port, inventory)
+    if _host_in(host, d["_desktop"]):
+        if not hints.get("obsidian_name"):
+            raise DetectError(400, "desktop vault on %s: the router sent no obsidian_name hint" % host)
+        return {"open_mode": "obsidian-uri", "obsidian_vault": hints["obsidian_name"],
+                "_detected": "desktop %s" % host}
+    raise DetectError(400, "cannot classify vault: %s is neither this agent's host nor in "
+                           "detect.desktop_hosts" % host)
+
+
 # ----------------------------------------------------------------------------- HTTP
 
 _GO_HTML = (
     "<!doctype html><meta charset=utf-8><title>Obsidian</title>"
-    "<p>%s</p><p><a href=\"%s\">Open the Obsidian GUI</a></p>"
+    "<p>%s</p>%s"
 )
+_GO_HTML_LINK = "<p><a href=\"%s\">Open the Obsidian GUI</a></p>"
 
 
-def make_handler(cfg, navigate_fn=None):
+def make_handler(cfg, navigate_fn=None, docker_runner=None):
     nav = navigate_fn or navigate
+    inventory = DockerInventory(cfg["detect"], docker_runner)
+
+    def resolve_view(vault, q):
+        """/view: (vault_cfg, hints) for a configured or detectable vault. Raises DetectError."""
+        if vault in cfg["vaults"]:
+            return cfg["vaults"][vault], None  # the manual entry wins, hints are ignored
+        raw = {"rest": (q.get("rest") or [""])[0], "obsidian_name": (q.get("obsidian_name") or [""])[0]}
+        if not (raw["rest"] or raw["obsidian_name"]):
+            raise DetectError(400, "unknown vault")
+        if not _printable(vault, 200):
+            raise DetectError(400, "invalid vault name")
+        # Detection needs both locks: only the router mints, and every link is signed.
+        if read_secret_file(cfg, "token_file")[0] != "on" or link_secret(cfg)[0] != "on":
+            raise DetectError(400, "vault detection requires token_file and a link-signing secret")
+        hints = normalize_hints(raw)
+        return detect_vault(cfg, hints, inventory), hints
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, obj):
@@ -315,8 +677,9 @@ def make_handler(cfg, navigate_fn=None):
             self.end_headers()
             self.wfile.write(body)
 
-        def _html(self, code, text, href):
-            body = (_GO_HTML % (html.escape(text), html.escape(href, quote=True))).encode()
+        def _html(self, code, text, href=None):
+            link = _GO_HTML_LINK % html.escape(href, quote=True) if href else ""
+            body = (_GO_HTML % (html.escape(text), link)).encode()
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -346,9 +709,11 @@ def make_handler(cfg, navigate_fn=None):
                 vault = (q.get("vault") or [""])[0]
                 note = (q.get("note") or [""])[0]
                 anchor = (q.get("h") or [""])[0]
-                vault_cfg = cfg["vaults"].get(vault)
-                if vault_cfg is None:
-                    return self._send(400, {"error": "unknown vault", "vaults": sorted(cfg["vaults"].keys())})
+                try:
+                    vault_cfg, hints = resolve_view(vault, q)
+                except DetectError as e:
+                    return self._send(e.code, {"error": e.msg, "vault": vault,
+                                               "vaults": sorted(cfg["vaults"].keys())})
                 if not note:
                     # No note: a direct link to the GUI (or the desktop vault), nothing to navigate.
                     if vault_cfg.get("open_mode") == "obsidian-uri":
@@ -360,13 +725,15 @@ def make_handler(cfg, navigate_fn=None):
                 if cfg.get("navigate_on_view"):
                     navigated = nav(vault_cfg, note, anchor)[0]
                 try:
-                    link = build_go_link(cfg, vault, note, anchor)
+                    link = build_go_link(cfg, vault, note, anchor, hints)
                 except RuntimeError as e:
                     return self._send(503, {"error": str(e)})
                 resp = {
                     "url": link,                      # the only field the router requires
                     "vault": vault, "note": note, "kind": "direct-go",
                     "navigated_on_view": navigated,
+                    "open_mode": vault_cfg.get("open_mode", "docker-exec"),
+                    "source": vault_cfg.get("_detected", "config"),
                 }
                 if cfg["link_ttl_s"]:
                     # Echoed by get_view_link as expiresInSeconds. Omitted for stable links:
@@ -375,10 +742,17 @@ def make_handler(cfg, navigate_fn=None):
                 return self._send(200, resp)
 
             if u.path == "/go":
-                ok, code, msg, vault, note, anchor = verify_go(cfg, q)
+                ok, code, msg, vault, note, anchor, hints = verify_go(cfg, q)
                 if not ok:
                     return self._send(code, {"error": msg})
-                vault_cfg = cfg["vaults"][vault]
+                if hints is None:
+                    vault_cfg = cfg["vaults"][vault]
+                else:
+                    # Re-detect on click: the container may have been recreated since /view.
+                    try:
+                        vault_cfg = detect_vault(cfg, normalize_hints(hints), inventory)
+                    except DetectError as e:
+                        return self._html(502, "The vault “%s” could not be located (%s)." % (vault, e.msg))
                 if vault_cfg.get("open_mode") == "obsidian-uri":
                     # Handed to the reader's desktop Obsidian. verify_go checks the signature,
                     # not the path: refuse absolute paths and `..` here too (unsigned setups).
