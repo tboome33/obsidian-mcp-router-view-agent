@@ -320,7 +320,7 @@ def _canonical(vault, note, anchor, exp, hints=None):
         # the hints from such a link therefore breaks its signature.
         return "v2\n" + json.dumps([vault, note, anchor or "", int(exp or 0),
                                     hints.get("rest", ""), hints.get("obsidian_name", ""),
-                                    hints.get("container", "")],
+                                    hints.get("container", ""), hints.get("vault_id", "")],
                                    ensure_ascii=True, separators=(",", ":"))
     return "\n".join([vault, note, anchor or "", str(exp or 0)])
 
@@ -355,6 +355,8 @@ def build_go_link(cfg, vault, note, anchor="", hints=None):
             params.append(("o", hints["obsidian_name"]))
         if hints.get("container"):
             params.append(("c", hints["container"]))
+        if hints.get("vault_id"):
+            params.append(("k", hints["vault_id"]))
     mode, secret = link_secret(cfg)
     if mode == "error":
         raise RuntimeError("link-signing secret unreadable")
@@ -373,7 +375,8 @@ def verify_go(cfg, q):
     anchor = (q.get("h") or [""])[0]
     exp_s = (q.get("e") or ["0"])[0]
     sig = (q.get("s") or [""])[0]
-    hints = {k: (q.get(p) or [""])[0] for k, p in (("rest", "r"), ("obsidian_name", "o"), ("container", "c"))}
+    hints = {k: (q.get(p) or [""])[0] for k, p in (("rest", "r"), ("obsidian_name", "o"), ("container", "c"),
+                                                   ("vault_id", "k"))}
     hints = {k: v for k, v in hints.items() if v} or None
     if not vault or not note:
         return (False, 400, "parameters v and n are required", vault, note, anchor, None)
@@ -396,6 +399,12 @@ def verify_go(cfg, q):
     if exp and time.time() > exp:
         return (False, 410, "link expired", vault, note, anchor, None)
     if vault in cfg["vaults"]:
+        if hints:
+            # A detection link for a name that has since been configured: the configured entry
+            # may point elsewhere, and a detection link was never checked against it. Refuse
+            # rather than open whatever the configuration now says; a fresh /view mints a
+            # configured link.
+            return (False, 409, "this vault is now configured: ask for a new link", vault, note, anchor, None)
         return (True, 200, "", vault, note, anchor, None)
     if not hints:
         return (False, 404, "unknown vault", vault, note, anchor, None)
@@ -482,6 +491,26 @@ class DetectError(Exception):
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _PORT_KEY_RE = re.compile(r"^([0-9]{1,5})/tcp$")
+_VAULT_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _mounts_identity(o):
+    """A container's vault identity: a digest of what it mounts (bind sources, named
+    volumes). Stable across `docker compose` recreations and image updates (unlike the
+    container ID); different when another vault is mounted under the same container name.
+    None when the container mounts nothing (then it holds no vault to identify)."""
+    mounts = o.get("Mounts")
+    srcs = set()
+    for m in (mounts if isinstance(mounts, list) else ()):
+        if not isinstance(m, dict):
+            continue
+        kind = m.get("Type")
+        src = m.get("Name") if kind == "volume" else m.get("Source") if kind == "bind" else None
+        if isinstance(src, str) and src and _printable(src, 4096):
+            srcs.add("%s:%s" % (kind, src))
+    if not srcs:
+        return None
+    return hashlib.sha256("\n".join(sorted(srcs)).encode("utf-8")).hexdigest()[:16]
 _WILDCARD_IPS = ("", "0.0.0.0", "::")
 
 
@@ -536,6 +565,11 @@ def normalize_hints(raw):
         if not (isinstance(container, str) and _CONTAINER_NAME_RE.match(container)):
             raise DetectError(400, "container hint: invalid container name")
         hints["container"] = container
+    vault_id = raw.get("vault_id")
+    if vault_id:
+        if not (isinstance(vault_id, str) and _VAULT_ID_RE.match(vault_id)):
+            raise DetectError(400, "vault_id hint: invalid")
+        hints["vault_id"] = vault_id
     return hints
 
 
@@ -628,7 +662,7 @@ class DockerInventory:
                         continue
                     hip = str(b.get("HostIp") or "")
                     ports.append((_norm_host(hip) if hip else "", int(hp), cport))
-            out.append({"id": cid, "name": name, "ports": ports})
+            out.append({"id": cid, "name": name, "ports": ports, "vault_id": _mounts_identity(o)})
         return out
 
 
@@ -658,6 +692,8 @@ def _detect_container(cfg, host, port, inventory, fresh=False):
         raise DetectError(400, "port %d is published by several containers (%s)"
                           % (port, ", ".join(sorted(c["name"] for c in hits))))
     c = hits[0]
+    if not c.get("vault_id"):
+        raise DetectError(400, "container %s mounts nothing: no vault to identify" % c["name"])
     inner = {cp for hip, hp, cp in c["ports"] if hp == port and _reachable(hip, host)}
     if len(inner) != 1:
         raise DetectError(400, "container %s maps port %d ambiguously" % (c["name"], port))
@@ -686,7 +722,8 @@ def _detect_container(cfg, host, port, inventory, fresh=False):
         "docker_path": d["docker_path"],
         "curl_path": d["curl_path"],
         "_detected": "container %s" % c["name"],
-        "_container_name": c["name"],     # the vault's identity, signed into the link
+        "_container_name": c["name"],     # the vault's identity, signed into the link:
+        "_vault_id": c["vault_id"],       # name + digest of its mounts
     }
 
 
@@ -742,9 +779,11 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
             raise DetectError(400, "vault detection requires token_file and a link-signing secret")
         hints = normalize_hints(raw)
         hints.pop("container", None)  # identity comes from Docker, never from the request
+        hints.pop("vault_id", None)
         found = detect_vault(cfg, hints, inventory)
         if found.get("_container_name"):
             hints["container"] = found["_container_name"]
+            hints["vault_id"] = found["_vault_id"]
         return found, hints
 
     class Handler(BaseHTTPRequestHandler):
@@ -848,7 +887,7 @@ def make_handler(cfg, navigate_fn=None, docker_runner=None):
                         vault_cfg = detect_vault(cfg, normalize_hints(hints), inventory, fresh=True)
                         signed_as = hints.get("container")
                         found_as = vault_cfg.get("_container_name")
-                        if signed_as != found_as:
+                        if (signed_as, hints.get("vault_id")) != (found_as, vault_cfg.get("_vault_id")):
                             # Another container now answers on that port (or the link names none):
                             # refuse rather than open a different vault with the same signed link.
                             raise DetectError(409, "the vault moved: this link was made for %s, "

@@ -231,9 +231,12 @@ ID_A = "a" * 64
 ID_B = "b" * 64
 
 
-def container(cid, name, ports, running=True):
-    """A `docker inspect` object; ports = {"<inner>/tcp": [(host_ip, host_port), ...]}."""
-    return {"Id": cid, "Name": "/" + name, "State": {"Running": running},
+def container(cid, name, ports, running=True, mounts=None):
+    """A `docker inspect` object; ports = {"<inner>/tcp": [(host_ip, host_port), ...]}.
+    By default the container mounts its own vault folder, /srv/vaults/<name>."""
+    if mounts is None:
+        mounts = [{"Type": "bind", "Source": "/srv/vaults/" + name, "Destination": "/vaults/x"}]
+    return {"Id": cid, "Name": "/" + name, "State": {"Running": running}, "Mounts": mounts,
             "NetworkSettings": {"Ports": {k: [{"HostIp": ip, "HostPort": str(p)} for ip, p in v]
                                           for k, v in ports.items()}}}
 
@@ -469,12 +472,15 @@ class TestDetectContainer(DetectBase):
         data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://localhost:27180"))
         self.assertEqual(data["source"], "container obs")
 
-    def test_configured_vault_wins_even_on_a_signed_hint_link(self):
-        hints = {"rest": "http://192.0.2.1:27180"}
-        link = va.build_go_link(self.cfg, "alice", "a.md", "", hints)   # signed v2, vault configured
+    def test_detection_link_for_a_since_configured_vault_is_refused(self):
+        # Minted by detection, then the same name was configured (maybe pointing elsewhere):
+        # the old link must not follow the configuration unchecked.
+        hints = {"rest": "http://192.0.2.1:27180", "container": "obsidian-notes", "vault_id": "0" * 16}
+        link = va.build_go_link(self.cfg, "alice", "a.md", "", hints)
         code, headers, _ = self.get(link.split("agent.test:27200", 1)[-1])
-        self.assertEqual(headers["Location"], "https://gui.test:3001/")
-        self.assertEqual(self.docker.cmds, [])
+        self.assertEqual(code, 409)
+        self.assertNotIn("Location", headers)
+        self.assertEqual(self.calls, [])
 
     def test_ipv4_mapped_local_address_is_local(self):
         data, _ = self.mint("vault=x&note=a.md&rest=" + urllib.parse.quote("http://[::ffff:192.0.2.1]:27180"))
@@ -516,6 +522,30 @@ class TestDetectContainer(DetectBase):
         self.assertNotIn("Location", headers)
         self.assertIn(b"obsidian-eve", body)
         self.assertEqual(self.calls, [])
+
+    def test_same_name_mounting_another_vault_is_refused_at_go(self):
+        _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        other = container("e" * 64, "obsidian-notes", {                # same name, another vault
+            "27180/tcp": [("0.0.0.0", 27180)], "3001/tcp": [("0.0.0.0", 3001)]},
+            mounts=[{"Type": "bind", "Source": "/srv/vaults/eve", "Destination": "/vaults/x"}])
+        self.docker.containers = [other]
+        code, headers, _ = self.get(path)
+        self.assertEqual(code, 409)
+        self.assertNotIn("Location", headers)
+        self.assertEqual(self.calls, [])
+
+    def test_container_mounting_nothing_is_not_a_vault(self):
+        self.docker.containers = [container(ID_A, "obs", {"27180/tcp": [("0.0.0.0", 27180)],
+                                                          "3001/tcp": [("0.0.0.0", 3001)]}, mounts=[])]
+        code, _, body = self.view("vault=x&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        self.assertEqual(code, 400)
+        self.assertIn("mounts nothing", json.loads(body)["error"])
+
+    def test_vault_identity_is_signed(self):
+        data, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
+        k = urllib.parse.parse_qs(urllib.parse.urlparse(data["url"]).query)["k"][0]
+        self.assertRegex(k, r"^[0-9a-f]{16}$")
+        self.assertEqual(self.get(path.replace("k=" + k, "k=" + "0" * 16))[0], 403)
 
     def test_recreated_container_keeps_its_name_and_is_found_again(self):
         _, path = self.mint("vault=notes&note=a.md&rest=" + urllib.parse.quote("http://192.0.2.1:27180"))
