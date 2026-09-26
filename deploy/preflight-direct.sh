@@ -22,6 +22,10 @@ fi
 [ -z "$C" ] && exit 1
 
 NET=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$C")
+# The REST port INSIDE the container (open_port) may differ from the published one.
+INNER=$(docker port "$C" 2>/dev/null | awk -v p=":$PORT" '$3 ~ p"$" {split($1,a,"/"); print a[1]; exit}')
+INNER="${INNER:-$PORT}"
+[ "$INNER" != "$PORT" ] && info "host port $PORT → container port $INNER (open_port = $INNER)"
 info "network mode: $NET"
 if [ "$NET" = "host" ]; then
   info "→ open_mode \"http\" with open_url http://127.0.0.1:$PORT works (the bridge sees 127.0.0.1)"
@@ -29,16 +33,27 @@ else
   info "→ open_mode \"docker-exec\" required (from the host, the bridge would see the Docker bridge IP, not loopback)"
 fi
 
+info "published ports (detect.gui_container_ports must name the GUI's container-side port):"
+docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{$p}} <- {{.HostIp}}:{{.HostPort}}  {{end}}{{end}}' "$C" | tr -s ' ' '\n' | paste -d' ' - - - | sed 's/^/         /'
+N=$(docker ps --format '{{.Ports}}' | grep -c ":$PORT->")
+[ "$N" -gt 1 ] && info "$N containers publish $PORT: detection refuses it unless their host IPs differ"
+
 echo "== 2. curl available inside the container"
 if docker exec "$C" sh -c 'command -v curl' >/dev/null 2>&1; then ok "curl present"; else ko "curl missing in $C (install it, or set curl_path)"; fi
 
 echo "== 3. Bridge /open route, seen from the container's loopback"
-CODE=$(docker exec "$C" curl -sS -o /dev/null -w '%{http_code}' --max-time 4 "http://127.0.0.1:$PORT/open/__preflight_missing__.md" 2>/dev/null || echo "000")
+CODE=$(docker exec "$C" curl -sS -o /dev/null -w '%{http_code}' --max-time 4 "http://127.0.0.1:$INNER/open/__preflight_missing__.md" 2>/dev/null)
+CODE="${CODE:-000}"
+if [ "$CODE" = 000 ]; then  # perhaps the REST API's TLS port: open_scheme "https"
+  CODE=$(docker exec "$C" curl -sSk -o /dev/null -w '%{http_code}' --max-time 4 "https://127.0.0.1:$INNER/open/__preflight_missing__.md" 2>/dev/null)
+  CODE="${CODE:-000}"
+  [ "$CODE" != 000 ] && info "port $INNER answers over https → open_scheme \"https\""
+fi
 case "$CODE" in
   404) ok "HTTP 404: /open is registered and the loopback guard is satisfied" ;;
   403) ko "HTTP 403: the call is not seen as loopback (bindingHost? proxy?)" ;;
   401) ko "HTTP 401: /open not registered (bridge < 0.2.0 or Local REST API < 4.0.0, or reload Obsidian)" ;;
-  000) ko "no answer on 127.0.0.1:$PORT inside the container (non-encrypted HTTP server disabled?)" ;;
+  000) ko "no answer on 127.0.0.1:$INNER inside the container (non-encrypted HTTP server disabled?)" ;;
   *)   info "HTTP $CODE (unexpected)" ;;
 esac
 
@@ -56,4 +71,4 @@ echo "== 6. Service user"
 id viewagent >/dev/null 2>&1 && ok "user viewagent exists" || info "create it: sudo useradd -r -s /usr/sbin/nologin -G docker viewagent"
 
 echo
-echo "Values for config.json: container=\"$C\"  open_port=$PORT  open_mode=$([ "$NET" = host ] && echo http || echo docker-exec)"
+echo "Values for config.json: container=\"$C\"  open_port=$INNER  open_mode=$([ "$NET" = host ] && echo http || echo docker-exec)"
